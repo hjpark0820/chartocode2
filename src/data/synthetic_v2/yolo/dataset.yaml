@@ -1,0 +1,7 @@
+# Chart Symbol Detection Dataset
+path: C:\Users\ziola\OneDrive\Documents\projects\chart-data-extractor\src\data\synthetic_v2\yolo
+train: C:\Users\ziola\OneDrive\Documents\projects\chart-data-extractor\src\data\synthetic_v2\yolo\train\images
+val: C:\Users\ziola\OneDrive\Documents\projects\chart-data-extractor\src\data\synthetic_v2\yolo\val\images
+
+nc: 8
+names: ['filled_circle', 'open_circle', 'filled_square', 'open_square', 'filled_triangle', 'open_triangle', 'filled_diamond', 'open_diamond']

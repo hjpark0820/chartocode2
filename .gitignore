@@ -1,0 +1,24 @@
+# Large directories
+/docs/
+/models/
+/data/
+
+# Pretrained weights
+*.pt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
