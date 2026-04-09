@@ -2,7 +2,6 @@
 
 
 # Pretrained weights
-*.pt
 
 # Python
 __pycache__/
