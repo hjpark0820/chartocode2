@@ -1,7 +1,5 @@
 # Large directories
-/docs/
-/models/
-/data/
+
 
 # Pretrained weights
 *.pt

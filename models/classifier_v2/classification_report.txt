@@ -1,0 +1,15 @@
+                 precision    recall  f1-score   support
+
+  filled_circle     0.6118    0.8991    0.7281       347
+    open_circle     0.5734    0.9111    0.7039       270
+  filled_square     0.5578    0.9228    0.6953       272
+    open_square     0.6018    0.9141    0.7258       291
+filled_triangle     0.5872    0.8750    0.7028       304
+  open_triangle     0.5655    0.9128    0.6983       298
+ filled_diamond     0.6224    0.9556    0.7538       338
+   open_diamond     0.5935    0.9254    0.7232       295
+     background     0.9749    0.7066    0.8193      4830
+
+       accuracy                         0.7760      7245
+      macro avg     0.6320    0.8914    0.7278      7245
+   weighted avg     0.8468    0.7760    0.7854      7245
