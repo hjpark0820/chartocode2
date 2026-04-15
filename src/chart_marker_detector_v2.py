@@ -124,6 +124,7 @@ def _pbar(done: int, total: int, t0: float, width: int = 40,
 VIT_INPUT       = 64
 BATCH_SIZE      = 512           # larger batch — data is now cheap to load
 EPOCHS          = 40
+EARLY_STOP_PATIENCE = 7        # stop if val_acc does not improve for this many epochs
 LR              = 3e-4
 USE_COMPILE     = False         # disabled — hangs on some Windows/GPU combos
 CONF_THRESH     = 0.65
@@ -204,16 +205,65 @@ def generate_one_plot(args_tuple):
     Y_MIN_PLOT   = Y_MIN   - Y_RANGE   * Y_MARGIN_FRAC
     Y_MAX_PLOT   = Y_MAX   + Y_RANGE   * Y_MARGIN_FRAC
 
+    # ── Overlap-minimised series generation ────────────────────────────────
+    # Three strategies to reduce symbol overlap:
+    #
+    #  1. EC50 slot partitioning (horizontal spread): the log-EC50 range is
+    #     widened to cover the full visible x-axis and divided into N_SYMBOLS
+    #     equal slots.  Each series is assigned a unique slot, guaranteeing
+    #     that the sigmoid transitions are spread evenly across the x-axis.
+    #
+    #  2. Staggered vertical bands (vertical spread): the [0, 1] y-range is
+    #     divided into N_SYMBOLS equal bands.  Each series is assigned a unique
+    #     band and its bottom/top are constrained to that band, so curves
+    #     occupy different vertical regions and cross less often.
+    #
+    #  3. Tiny x-jitter (±5% of sub-interval): symbols from different series
+    #     are never exactly co-located in the same pixel column.
+
+    # --- EC50 slots (horizontal) ---
+    LOG_EC50_MIN = -14.5   # widened from -13.5 for more horizontal spread
+    LOG_EC50_MAX =  -7.5   # widened from  -8.5
+    ec50_slot_w  = (LOG_EC50_MAX - LOG_EC50_MIN) / N_SYMBOLS
+    ec50_slots   = np_rng.permutation(N_SYMBOLS)
+
+    # --- Vertical bands ---
+    # Each band spans 1/N_SYMBOLS of the [0, 1] y-range.
+    # A small intra-band margin keeps bottom/top away from band edges.
+    band_h   = 1.0 / N_SYMBOLS          # height of each band
+    band_margin = band_h * 0.10         # 10% margin inside each band
+    y_bands  = np_rng.permutation(N_SYMBOLS)  # shuffled band assignment
+
+    # --- Shared nominal x-positions with tiny per-series jitter ---
+    x_sub_w   = (LOG_MAX - LOG_MIN) / N_POINTS
+    x_nominal = np.array([
+        10 ** (LOG_MIN + (k + 0.5) * x_sub_w) for k in range(N_POINTS)
+    ])
+
     series_data = []
     for si in range(N_SYMBOLS):
-        bottom = np_rng.uniform(0.05, 0.15)
-        top    = np_rng.uniform(0.80, 1.00)
-        ec50   = 10 ** np_rng.uniform(-12, -8)
-        n_hill = np_rng.uniform(0.8, 2.5)
-        x_vals = make_series_x(N_POINTS, LOG_MIN, LOG_MAX)
+        # EC50: unique slot → sigmoid transition at a different x-position
+        slot   = ec50_slots[si]
+        log_ec = LOG_EC50_MIN + ec50_slot_w * slot + np_rng.uniform(0.05, 0.95) * ec50_slot_w
+        ec50   = 10 ** log_ec
+
+        # Vertical band: bottom and top constrained to the assigned band
+        band_idx = y_bands[si]
+        band_lo  = band_idx * band_h + band_margin
+        band_hi  = (band_idx + 1) * band_h - band_margin
+        bottom   = np_rng.uniform(band_lo, band_lo + (band_hi - band_lo) * 0.3)
+        top      = np_rng.uniform(band_lo + (band_hi - band_lo) * 0.7, band_hi)
+
+        n_hill = np_rng.uniform(0.8, 4.0)   # wider slope range for more diversity
+
+        # Tiny x-jitter: ±5% of sub-interval width in log space
+        jitter = np_rng.uniform(-0.05, 0.05, N_POINTS) * x_sub_w
+        x_vals = np.array([
+            10 ** (np.log10(x_nominal[k]) + jitter[k]) for k in range(N_POINTS)
+        ])
         y_vals = hill(x_vals, bottom, top, ec50, n_hill)
-        y_vals += np_rng.normal(0, 0.01, N_POINTS)
-        y_vals  = np.clip(y_vals, Y_MIN + 0.02, Y_MAX - 0.02)
+        y_vals += np_rng.normal(0, 0.005, N_POINTS)
+        y_vals  = np.clip(y_vals, Y_MIN + 0.01, Y_MAX - 0.01)
         series_data.append((x_vals, y_vals))
 
     z_order = list(range(N_SYMBOLS))
@@ -256,10 +306,19 @@ def generate_one_plot(args_tuple):
 
     buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
     buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))
-    img_bgr = cv2.cvtColor(buf, cv2.COLOR_RGBA2BGR)
+    # Composite RGBA onto a white background before converting to BGR.
+    # Without this, open symbols rendered with markerfacecolor='white' on a
+    # transparent figure get alpha=0 for their white-fill pixels, which then
+    # become indistinguishable from the background after RGBA→BGR conversion.
+    rgba_f   = buf.astype(np.float32) / 255.0
+    alpha    = rgba_f[:, :, 3:4]
+    white_bg = np.ones_like(rgba_f[:, :, :3])
+    rgb_comp = rgba_f[:, :, :3] * alpha + white_bg * (1.0 - alpha)
+    img_bgr  = cv2.cvtColor((rgb_comp * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
     H_px, W_px = img_bgr.shape[:2]
 
-    gt_points = []
+    # Build raw gt_points (all symbol centres)
+    raw_points = []
     for si in range(N_SYMBOLS):
         x_vals, y_vals = series_data[si]
         for xi, yi in zip(x_vals, y_vals):
@@ -268,11 +327,26 @@ def generate_one_plot(args_tuple):
             py = int(round(H_px - disp[1]))
             px = max(0, min(W_px - 1, px))
             py = max(0, min(H_px - 1, py))
-            gt_points.append({
-                "cx": px, "cy": py,
-                "class_idx": si,
-                "class_name": CLASS_NAMES[si]
-            })
+            raw_points.append({"cx": px, "cy": py,
+                               "class_idx": si,
+                               "class_name": CLASS_NAMES[si]})
+
+    # Minimum-distance filter: drop any point whose centre is within
+    # MIN_SEP pixels of an already-accepted point.  This removes the
+    # patches where two symbols are so close that neither can be
+    # classified cleanly.  MIN_SEP = 1.5 × symbol diameter.
+    MIN_SEP = int(round(P * 1.5))
+    accepted = []   # list of (cx, cy) already kept
+    gt_points = []
+    for pt in raw_points:
+        cx, cy = pt["cx"], pt["cy"]
+        too_close = any(
+            (cx - ax2) ** 2 + (cy - ay2) ** 2 < MIN_SEP ** 2
+            for ax2, ay2 in accepted
+        )
+        if not too_close:
+            accepted.append((cx, cy))
+            gt_points.append(pt)
 
     bbox  = ax.get_position()
     pa_x0 = int(round(bbox.x0 * W_px))
@@ -721,6 +795,7 @@ def train(n_plots: int = N_PLOTS):
     scaler    = GradScaler(enabled=(device.type == "cuda"))
 
     best_acc = 0.0
+    no_improve_epochs = 0          # early stopping counter
     MODEL_SAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
     train_start = time.time()
 
@@ -794,16 +869,28 @@ def train(n_plots: int = N_PLOTS):
                       prefix=f"Epoch {epoch:3d}/{EPOCHS} val:   ")
         va_acc = va_correct / va_total
 
-        if va_acc > best_acc:
+        improved = va_acc > best_acc
+        if improved:
             best_acc = va_acc
+            no_improve_epochs = 0
             save_model = model._orig_mod if hasattr(model, "_orig_mod") else model
             torch.save(save_model.state_dict(), str(MODEL_SAVE_PATH))
+        else:
+            no_improve_epochs += 1
 
         epoch_elapsed = time.time() - epoch_t0
+        stop_info = (f"  [no improvement {no_improve_epochs}/{EARLY_STOP_PATIENCE}]"
+                     if not improved else "  [saved]")
         print(f"  Epoch {epoch:3d}/{EPOCHS} | "
               f"loss={tr_loss/tr_total:.4f} | "
               f"val_acc={va_acc:.4f} | best={best_acc:.4f} | "
-              f"{epoch_elapsed:.0f}s")
+              f"{epoch_elapsed:.0f}s{stop_info}")
+
+        if no_improve_epochs >= EARLY_STOP_PATIENCE:
+            print(f"\n  Early stopping: val_acc did not improve for "
+                  f"{EARLY_STOP_PATIENCE} consecutive epochs.")
+            print(f"  Best val_acc = {best_acc:.4f} (saved at earlier epoch)")
+            break
 
     del t_mmap, l_mmap
     train_elapsed = time.time() - train_start
