@@ -1,0 +1,452 @@
+{
+  "plot_idx": 248,
+  "image_path": "C:\\Users\\ziola\\OneDrive\\Documents\\GitHub\\chartocode\\src\\synthetic_plots\\plot_0248.png",
+  "image_size": {
+    "w": 640,
+    "h": 480
+  },
+  "n_series": 11,
+  "n_points": 8,
+  "series": [
+    {
+      "series_idx": 7,
+      "symbol_class": 7,
+      "symbol_name": "filled_inv_triangle",
+      "corner_density": 0.8480974702668014,
+      "points": [
+        {
+          "px": 19,
+          "py": 440
+        },
+        {
+          "px": 105,
+          "py": 457
+        },
+        {
+          "px": 191,
+          "py": 447
+        },
+        {
+          "px": 277,
+          "py": 438
+        },
+        {
+          "px": 363,
+          "py": 308
+        },
+        {
+          "px": 449,
+          "py": 153
+        },
+        {
+          "px": 535,
+          "py": 132
+        },
+        {
+          "px": 621,
+          "py": 144
+        }
+      ]
+    },
+    {
+      "series_idx": 4,
+      "symbol_class": 4,
+      "symbol_name": "open_triangle",
+      "corner_density": 0.6992754672610663,
+      "points": [
+        {
+          "px": 19,
+          "py": 448
+        },
+        {
+          "px": 105,
+          "py": 455
+        },
+        {
+          "px": 191,
+          "py": 455
+        },
+        {
+          "px": 277,
+          "py": 417
+        },
+        {
+          "px": 363,
+          "py": 342
+        },
+        {
+          "px": 449,
+          "py": 225
+        },
+        {
+          "px": 535,
+          "py": 140
+        },
+        {
+          "px": 621,
+          "py": 117
+        }
+      ]
+    },
+    {
+      "series_idx": 2,
+      "symbol_class": 2,
+      "symbol_name": "filled_square",
+      "corner_density": 0.7983600681836415,
+      "points": [
+        {
+          "px": 19,
+          "py": 414
+        },
+        {
+          "px": 105,
+          "py": 419
+        },
+        {
+          "px": 191,
+          "py": 420
+        },
+        {
+          "px": 277,
+          "py": 428
+        },
+        {
+          "px": 363,
+          "py": 292
+        },
+        {
+          "px": 449,
+          "py": 106
+        },
+        {
+          "px": 535,
+          "py": 76
+        },
+        {
+          "px": 621,
+          "py": 70
+        }
+      ]
+    },
+    {
+      "series_idx": 1,
+      "symbol_class": 1,
+      "symbol_name": "open_circle",
+      "corner_density": 0.724172897086241,
+      "points": [
+        {
+          "px": 19,
+          "py": 444
+        },
+        {
+          "px": 105,
+          "py": 438
+        },
+        {
+          "px": 191,
+          "py": 429
+        },
+        {
+          "px": 277,
+          "py": 444
+        },
+        {
+          "px": 363,
+          "py": 416
+        },
+        {
+          "px": 449,
+          "py": 150
+        },
+        {
+          "px": 535,
+          "py": 89
+        },
+        {
+          "px": 621,
+          "py": 62
+        }
+      ]
+    },
+    {
+      "series_idx": 5,
+      "symbol_class": 5,
+      "symbol_name": "open_inv_triangle",
+      "corner_density": 0.6841416068669495,
+      "points": [
+        {
+          "px": 19,
+          "py": 449
+        },
+        {
+          "px": 105,
+          "py": 442
+        },
+        {
+          "px": 191,
+          "py": 429
+        },
+        {
+          "px": 277,
+          "py": 424
+        },
+        {
+          "px": 363,
+          "py": 370
+        },
+        {
+          "px": 449,
+          "py": 296
+        },
+        {
+          "px": 535,
+          "py": 220
+        },
+        {
+          "px": 621,
+          "py": 182
+        }
+      ]
+    },
+    {
+      "series_idx": 8,
+      "symbol_class": 8,
+      "symbol_name": "open_rhombus",
+      "corner_density": 0.6903415653124434,
+      "points": [
+        {
+          "px": 19,
+          "py": 461
+        },
+        {
+          "px": 105,
+          "py": 461
+        },
+        {
+          "px": 191,
+          "py": 449
+        },
+        {
+          "px": 277,
+          "py": 421
+        },
+        {
+          "px": 363,
+          "py": 380
+        },
+        {
+          "px": 449,
+          "py": 223
+        },
+        {
+          "px": 535,
+          "py": 129
+        },
+        {
+          "px": 621,
+          "py": 69
+        }
+      ]
+    },
+    {
+      "series_idx": 6,
+      "symbol_class": 6,
+      "symbol_name": "filled_triangle",
+      "corner_density": 0.3246356715316605,
+      "points": [
+        {
+          "px": 19,
+          "py": 446
+        },
+        {
+          "px": 105,
+          "py": 461
+        },
+        {
+          "px": 191,
+          "py": 444
+        },
+        {
+          "px": 277,
+          "py": 445
+        },
+        {
+          "px": 363,
+          "py": 413
+        },
+        {
+          "px": 449,
+          "py": 254
+        },
+        {
+          "px": 535,
+          "py": 149
+        },
+        {
+          "px": 621,
+          "py": 152
+        }
+      ]
+    },
+    {
+      "series_idx": 10,
+      "symbol_class": 10,
+      "symbol_name": "x_marker",
+      "corner_density": 0.08631101564438914,
+      "points": [
+        {
+          "px": 19,
+          "py": 453
+        },
+        {
+          "px": 105,
+          "py": 422
+        },
+        {
+          "px": 191,
+          "py": 443
+        },
+        {
+          "px": 277,
+          "py": 426
+        },
+        {
+          "px": 363,
+          "py": 396
+        },
+        {
+          "px": 449,
+          "py": 220
+        },
+        {
+          "px": 535,
+          "py": 137
+        },
+        {
+          "px": 621,
+          "py": 147
+        }
+      ]
+    },
+    {
+      "series_idx": 3,
+      "symbol_class": 3,
+      "symbol_name": "open_square",
+      "corner_density": 0.7173417300064081,
+      "points": [
+        {
+          "px": 19,
+          "py": 408
+        },
+        {
+          "px": 105,
+          "py": 427
+        },
+        {
+          "px": 191,
+          "py": 413
+        },
+        {
+          "px": 277,
+          "py": 408
+        },
+        {
+          "px": 363,
+          "py": 394
+        },
+        {
+          "px": 449,
+          "py": 224
+        },
+        {
+          "px": 535,
+          "py": 113
+        },
+        {
+          "px": 621,
+          "py": 117
+        }
+      ]
+    },
+    {
+      "series_idx": 9,
+      "symbol_class": 9,
+      "symbol_name": "filled_rhombus",
+      "corner_density": 0.4925313246974161,
+      "points": [
+        {
+          "px": 19,
+          "py": 392
+        },
+        {
+          "px": 105,
+          "py": 388
+        },
+        {
+          "px": 191,
+          "py": 398
+        },
+        {
+          "px": 277,
+          "py": 392
+        },
+        {
+          "px": 363,
+          "py": 343
+        },
+        {
+          "px": 449,
+          "py": 289
+        },
+        {
+          "px": 535,
+          "py": 223
+        },
+        {
+          "px": 621,
+          "py": 183
+        }
+      ]
+    },
+    {
+      "series_idx": 0,
+      "symbol_class": 0,
+      "symbol_name": "filled_circle",
+      "corner_density": 0.8367723704572287,
+      "points": [
+        {
+          "px": 19,
+          "py": 399
+        },
+        {
+          "px": 105,
+          "py": 379
+        },
+        {
+          "px": 191,
+          "py": 390
+        },
+        {
+          "px": 277,
+          "py": 374
+        },
+        {
+          "px": 363,
+          "py": 312
+        },
+        {
+          "px": 449,
+          "py": 223
+        },
+        {
+          "px": 535,
+          "py": 110
+        },
+        {
+          "px": 621,
+          "py": 105
+        }
+      ]
+    }
+  ]
+}
