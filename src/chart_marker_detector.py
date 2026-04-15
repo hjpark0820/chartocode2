@@ -1,806 +1,823 @@
 """
-Chart Marker Detector — Full Pipeline  (GPU-optimised for RTX 5060 + 16-core CPU)
-==================================================================================
-Key design choices
-------------------
-  • All symbols are rendered in BLACK on a WHITE plot background — matching
-    typical scientific publication style.
-  • Open symbols (open_circle, open_square, open_triangle, etc.) use a
-    TRANSPARENT interior: the white interior fill is NOT stamped onto the
-    canvas, so underlying line segments remain visible through the symbol.
-    Only the outline strokes are composited onto the plot.
-  • Filled symbols stamp their solid black shape directly onto the canvas.
-  • Subimage patches therefore contain the real mixed pixel content
-    (symbol outline + whatever line/background is underneath), not an
-    artificial white-blocked region.
+chart_marker_detector_v2.py
+============================
+Working directory : C:\\Users\\ziola\\OneDrive\\Documents\\GitHub\\chartocode\\src
+Model save path   : ../models/chart_marker_net_v2.pth   (relative to src/)
 
-GPU speedup techniques (RTX 5060 + 16-core CPU)
--------------------------------------------------
-  1. torch.cuda.amp  — Automatic Mixed Precision (FP16)
-  2. num_workers=8   — Parallel DataLoader workers
-  3. pin_memory=True + persistent_workers + prefetch_factor=4
-  4. torch.compile() — TorchInductor (CUDA only; skipped on CPU/Windows)
-  5. Batch size 128  — Better GPU utilisation
-  6. cudnn.benchmark — Auto-selects fastest conv algorithm
-  7. Parallel plot generation via multiprocessing.Pool (16 cores)
-  8. Pre-built TensorDataset — patches converted to tensors once
-
-11 symbol classes + background
--------------------------------
-  0  filled_circle          6  filled_triangle
-  1  open_circle            7  filled_inv_triangle
-  2  filled_square          8  open_rhombus
-  3  open_square            9  filled_rhombus
-  4  open_triangle         10  x_marker
-  5  open_inv_triangle     11  background
-
-Usage
+USAGE
 -----
-  python chart_marker_detector.py --mode train
-  python chart_marker_detector.py --mode detect --image path/to/plotting_area.png
+  # Train (generates 2000+ synthetic plots, extracts subimages, trains ViT)
+  python chart_marker_detector_v2.py --mode train
+
+  # Detect markers in a plotting-area image
+  python chart_marker_detector_v2.py --mode detect --image path/to/plotting_area.png
+
+REQUIREMENTS
+------------
+  pip install timm torch torchvision opencv-python matplotlib scikit-learn numpy
+  For GPU: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 """
 
-import argparse
-import os
-import json
-import math
-import random
-import warnings
-import multiprocessing as mp
+from __future__ import annotations
+import argparse, io, json, math, os, random, time, warnings
+from collections import defaultdict
 from pathlib import Path
+import multiprocessing as mp
 
 import cv2
-import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader, Dataset
 import timm
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix
 
 warnings.filterwarnings("ignore")
-torch.backends.cudnn.benchmark = True
+mp.freeze_support()
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  PATHS  (relative to src/)
+# ══════════════════════════════════════════════════════════════════════════════
+_SRC_DIR        = Path(__file__).parent
+MODEL_SAVE_PATH = _SRC_DIR / ".." / "models" / "chart_marker_net_v2.pth"
+SYNTH_DIR       = _SRC_DIR / ".." / "data" / "synthetic_plots"
+SUBIMG_DIR      = _SRC_DIR / ".." / "data" / "subimages"
 
-OUTPUT_MODEL_DIR = r"C:\Users\ziola\OneDrive\Documents\GitHub\chartocode\models"
-_model_dir = Path(OUTPUT_MODEL_DIR)
-if not _model_dir.exists():
-    _model_dir = Path(__file__).parent / "models"
-_model_dir.mkdir(parents=True, exist_ok=True)
-
-WORK_DIR   = Path(__file__).parent
-SYNTH_DIR  = WORK_DIR / "synthetic_plots"
-GT_DIR     = SYNTH_DIR / "ground_truth"
-MODEL_PATH = _model_dir / "chart_marker_net.pth"
-
-SYNTH_DIR.mkdir(parents=True, exist_ok=True)
-GT_DIR.mkdir(parents=True, exist_ok=True)
-
-# Plot canvas
-PLOT_W, PLOT_H = 640, 480
-
-# Symbol & window
-SYM_RADIUS = 6          # half-size of rendered symbol in pixels
-P          = 19         # sliding window / subimage size (must be odd)
-HALF       = P // 2
-VIT_INPUT  = 64         # ViT input resolution
-
-# Dataset
-N_PLOTS        = 520
-N_SERIES       = 11
-N_POINTS       = 8
-PATCHES_POS    = 60     # positive patches per symbol per plot
-PATCHES_OFF    = 40     # slightly-off patches per symbol per plot
-PATCHES_BG     = 80     # random background patches per plot
-
-# Training
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ══════════════════════════════════════════════════════════════════════════════
+N_PLOTS         = 2100          # synthetic plots to generate
+SYMBOL_DIAM     = 12            # base symbol diameter in pixels
+P_FACTOR        = 1.20          # p = ceil(SYMBOL_DIAM * P_FACTOR) → must be odd
+P               = int(math.ceil(SYMBOL_DIAM * P_FACTOR)) | 1  # ensure odd
+HALF            = P // 2
+VIT_INPUT       = 64            # ViT input resolution
+PLOT_W, PLOT_H  = 560, 420      # synthetic plot canvas (plotting area only)
+N_POINTS        = 12            # data points per series
+BATCH_SIZE      = 256
 EPOCHS          = 40
-BATCH_SIZE      = 128
 LR              = 3e-4
-WEIGHT_DECAY    = 0.01
-NUM_WORKERS     = 8
-PREFETCH_FACTOR = 4
-USE_AMP         = True
-USE_COMPILE     = True   # activated only when CUDA is available
+USE_COMPILE     = True          # set False if triton not installed
+CONF_THRESH     = 0.65          # detection confidence threshold
+STRIDE          = 2             # sliding window stride
+NMS_RADIUS      = P * 1.5       # per-class NMS suppression radius
+UNKNOWN_THRESH  = 0.40          # below this max-prob → "unknown"
+MIN_DARK_FRAC   = 0.03          # ignore windows with too few dark pixels
+WORKERS         = min(8, mp.cpu_count())
 
-# Inference
-STRIDE      = 2
-CONF_THRESH = 0.65
-NMS_RADIUS  = P * 1.5
-
+# 11 symbol classes + background
 CLASS_NAMES = [
-    "filled_circle", "open_circle",
-    "filled_square", "open_square",
-    "open_triangle", "open_inv_triangle",
-    "filled_triangle", "filled_inv_triangle",
-    "open_rhombus", "filled_rhombus",
-    "x_marker",
-    "background",
+    "filled_circle",        # 0  → matplotlib marker 'o', filled black
+    "open_circle",          # 1  → matplotlib marker 'o', open (white fill)
+    "filled_square",        # 2  → matplotlib marker 's', filled black
+    "open_square",          # 3  → matplotlib marker 's', open (white fill)
+    "open_triangle",        # 4  → matplotlib marker '^', open
+    "open_inv_triangle",    # 5  → matplotlib marker 'v', open
+    "filled_triangle",      # 6  → matplotlib marker '^', filled black
+    "filled_inv_triangle",  # 7  → matplotlib marker 'v', filled black
+    "open_rhombus",         # 8  → matplotlib marker 'D', open
+    "filled_rhombus",       # 9  → matplotlib marker 'D', filled black
+    "x_marker",             # 10 → matplotlib marker 'x'
+    "background",           # 11
 ]
-N_CLASSES = len(CLASS_NAMES)   # 12
+N_CLASSES  = len(CLASS_NAMES)
+N_SYMBOLS  = N_CLASSES - 1   # 11
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  PART 1 — SYMBOL RENDERING  (RGBA — transparent interior for open shapes)
-# ═══════════════════════════════════════════════════════════════════════════
+# matplotlib marker codes and fill styles for each symbol class
+# (marker, filled)  — filled=True → facecolor black, filled=False → facecolor white
+_MPL_MARKERS = [
+    ('o', True),    # 0  filled_circle
+    ('o', False),   # 1  open_circle
+    ('s', True),    # 2  filled_square
+    ('s', False),   # 3  open_square
+    ('^', False),   # 4  open_triangle
+    ('v', False),   # 5  open_inv_triangle
+    ('^', True),    # 6  filled_triangle
+    ('v', True),    # 7  filled_inv_triangle
+    ('D', False),   # 8  open_rhombus
+    ('D', True),    # 9  filled_rhombus
+    ('x', True),    # 10 x_marker  (x has no fill concept — always black)
+]
 
-def render_symbol_rgba(cls_idx: int, size: int = P,
-                       corner_density: float = 0.0) -> np.ndarray:
+_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SYMBOL RENDERING  — uses matplotlib default markers
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Pre-rendered symbol cache: sym_id → RGBA uint8 (SYMBOL_DIAM × SYMBOL_DIAM)
+_SYMBOL_CACHE: dict[int, np.ndarray] = {}
+
+
+def render_symbol(sym_id: int, d: int = SYMBOL_DIAM,
+                  corner_density: float = 0.0) -> np.ndarray:
     """
-    Render symbol cls_idx into a (size × size, 4) RGBA uint8 image.
-    Alpha channel:
-      • Filled symbols  → fully opaque black shape (alpha=255).
-      • Open symbols    → white-filled interior + opaque black outline.
-                          The white fill occludes any lines beneath the symbol,
-                          matching real scientific plot appearance.
-    Background pixels (outside the symbol) are always transparent.
+    Render symbol sym_id using matplotlib's default marker into a d×d RGBA image.
+    corner_density is accepted for API compatibility but ignored (matplotlib handles
+    corner rounding automatically for square markers).
+    Returns RGBA uint8 array.
     """
-    img = np.zeros((size, size, 4), dtype=np.uint8)   # fully transparent
-    cx = cy = size // 2
-    r  = max(2, size // 3)
-    thick = max(1, size // 10)
-    BLACK_OPAQUE = (0, 0, 0, 255)
+    cache_key = (sym_id, d)
+    if cache_key in _SYMBOL_CACHE:
+        return _SYMBOL_CACHE[cache_key].copy()
 
-    # ── helper: square corner points with optional Bézier rounding ─────────
-    def square_pts(smooth=0.0):
-        if smooth < 0.05:
-            return np.array([[cx-r, cy-r], [cx+r, cy-r],
-                              [cx+r, cy+r], [cx-r, cy+r]], dtype=np.float32)
-        k = smooth * r * 0.6
-        corners = [(-r, -r), (r, -r), (r, r), (-r, r)]
-        pts = []
-        for i, (dx, dy) in enumerate(corners):
-            nx1, ny1 = corners[(i - 1) % 4]
-            nx2, ny2 = corners[(i + 1) % 4]
-            tx1 = 0 if dx == nx1 else np.sign(nx1 - dx)
-            ty1 = 0 if dy == ny1 else np.sign(ny1 - dy)
-            tx2 = 0 if dx == nx2 else np.sign(nx2 - dx)
-            ty2 = 0 if dy == ny2 else np.sign(ny2 - dy)
-            p0 = np.array([cx+dx+tx1*k, cy+dy+ty1*k])
-            p1 = np.array([cx+dx,       cy+dy      ])
-            p2 = np.array([cx+dx+tx2*k, cy+dy+ty2*k])
-            for t in np.linspace(0, 1, 8):
-                pts.append((1-t)**2*p0 + 2*(1-t)*t*p1 + t**2*p2)
-        return np.array(pts, dtype=np.float32)
+    marker, filled = _MPL_MARKERS[sym_id]
 
-    def tri_pts(inv=False):
-        s = -1 if not inv else 1
-        return np.array([[cx, cy-s*r], [cx+r, cy+s*r], [cx-r, cy+s*r]],
-                        dtype=np.float32)
+    # DPI and figure size chosen so the rendered symbol is exactly d px
+    dpi    = 100
+    fig_px = d * 4          # render at 4× then downscale for anti-aliasing
+    fig_in = fig_px / dpi
 
-    def rhombus_pts():
-        return np.array([[cx, cy-r], [cx+r, cy], [cx, cy+r], [cx-r, cy]],
-                        dtype=np.float32)
+    fig, ax = plt.subplots(figsize=(fig_in, fig_in), dpi=dpi)
+    fig.patch.set_facecolor("none")
+    ax.set_facecolor("none")
+    ax.set_xlim(-1, 1); ax.set_ylim(-1, 1)
+    ax.axis("off")
 
-    # ── filled symbols: stamp solid black shape ─────────────────────────────
-    if cls_idx == 0:   # filled_circle
-        cv2.circle(img, (cx, cy), r, BLACK_OPAQUE, -1)
+    # marker size in points: fill ~70% of the figure
+    ms = fig_px * 0.65
 
-    elif cls_idx == 2:  # filled_square
-        cv2.fillPoly(img, [square_pts(corner_density).astype(np.int32)], BLACK_OPAQUE)
+    fc = "black" if filled else "white"
+    ec = "black"
+    lw = max(1.0, d * 0.10)
 
-    elif cls_idx == 6:  # filled_triangle
-        cv2.fillPoly(img, [tri_pts(False).astype(np.int32)], BLACK_OPAQUE)
+    ax.plot(0, 0, marker=marker,
+            markersize=ms,
+            markerfacecolor=fc,
+            markeredgecolor=ec,
+            markeredgewidth=lw,
+            linestyle="none")
 
-    elif cls_idx == 7:  # filled_inv_triangle
-        cv2.fillPoly(img, [tri_pts(True).astype(np.int32)], BLACK_OPAQUE)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi,
+                bbox_inches="tight", pad_inches=0,
+                transparent=True)
+    plt.close(fig)
+    buf.seek(0)
 
-    elif cls_idx == 9:  # filled_rhombus
-        cv2.fillPoly(img, [rhombus_pts().astype(np.int32)], BLACK_OPAQUE)
+    # decode PNG → RGBA
+    arr = np.frombuffer(buf.read(), dtype=np.uint8)
+    rgba_full = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)   # H×W×4
+    if rgba_full is None or rgba_full.ndim < 3:
+        # fallback: white square
+        rgba_full = np.zeros((fig_px, fig_px, 4), dtype=np.uint8)
+        rgba_full[:, :, :3] = 255
 
-    elif cls_idx == 10:  # x_marker
-        d = max(2, r - 1)
-        cv2.line(img, (cx-d, cy-d), (cx+d, cy+d), BLACK_OPAQUE, thick+1)
-        cv2.line(img, (cx+d, cy-d), (cx-d, cy+d), BLACK_OPAQUE, thick+1)
+    # downscale to d×d with INTER_AREA for clean anti-aliasing
+    rgba_d = cv2.resize(rgba_full, (d, d), interpolation=cv2.INTER_AREA)
 
-    # ── open symbols: transparent interior, opaque outline only ────────────
-    elif cls_idx == 1:  # open_circle — white fill + black outline
-        cv2.circle(img, (cx, cy), r, (255, 255, 255, 255), -1)   # white fill
-        cv2.circle(img, (cx, cy), r, BLACK_OPAQUE, thick)         # black outline
+    # ensure open symbols have fully opaque white interior (not semi-transparent)
+    if not filled and marker != 'x':
+        # flood-fill the interior region with white+opaque
+        gray = rgba_d[:, :, 3]
+        _, bw = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+        # find interior: invert mask, flood from centre
+        interior = np.zeros((d + 2, d + 2), dtype=np.uint8)
+        cv2.floodFill(255 - bw, interior, (d // 2, d // 2), 255)
+        interior = interior[1:-1, 1:-1]
+        mask = interior > 0
+        rgba_d[mask, 0] = 255  # R
+        rgba_d[mask, 1] = 255  # G
+        rgba_d[mask, 2] = 255  # B
+        rgba_d[mask, 3] = 255  # A (fully opaque white)
 
-    elif cls_idx == 3:  # open_square — white fill + black outline
-        pts = square_pts(corner_density).astype(np.int32)
-        cv2.fillPoly(img, [pts], (255, 255, 255, 255))             # white fill
-        cv2.polylines(img, [pts], True, BLACK_OPAQUE, thick)       # black outline
-
-    elif cls_idx == 4:  # open_triangle — white fill + black outline
-        pts = tri_pts(False).astype(np.int32)
-        cv2.fillPoly(img, [pts], (255, 255, 255, 255))             # white fill
-        cv2.polylines(img, [pts], True, BLACK_OPAQUE, thick)       # black outline
-
-    elif cls_idx == 5:  # open_inv_triangle — white fill + black outline
-        pts = tri_pts(True).astype(np.int32)
-        cv2.fillPoly(img, [pts], (255, 255, 255, 255))             # white fill
-        cv2.polylines(img, [pts], True, BLACK_OPAQUE, thick)       # black outline
-
-    elif cls_idx == 8:  # open_rhombus — white fill + black outline
-        pts = rhombus_pts().astype(np.int32)
-        cv2.fillPoly(img, [pts], (255, 255, 255, 255))             # white fill
-        cv2.polylines(img, [pts], True, BLACK_OPAQUE, thick)       # black outline
-
-    return img   # RGBA uint8
+    _SYMBOL_CACHE[cache_key] = rgba_d.copy()
+    return rgba_d
 
 
-def composite_symbol(canvas_rgb: np.ndarray,
-                     sym_rgba: np.ndarray,
+def composite_symbol(canvas_bgr: np.ndarray, sym_rgba: np.ndarray,
                      cx: int, cy: int) -> None:
+    """Alpha-composite sym_rgba centred at (cx,cy) onto canvas_bgr (in-place)."""
+    d  = sym_rgba.shape[0]
+    hd = d // 2
+    H, W = canvas_bgr.shape[:2]
+    sx0, sy0 = 0, 0
+    sx1, sy1 = d, d
+    dx0 = cx - hd; dy0 = cy - hd
+    dx1 = dx0 + d; dy1 = dy0 + d
+    if dx0 < 0: sx0 -= dx0; dx0 = 0
+    if dy0 < 0: sy0 -= dy0; dy0 = 0
+    if dx1 > W: sx1 -= (dx1 - W); dx1 = W
+    if dy1 > H: sy1 -= (dy1 - H); dy1 = H
+    if dx0 >= dx1 or dy0 >= dy1: return
+    patch = sym_rgba[sy0:sy1, sx0:sx1]
+    alpha = patch[:, :, 3:4].astype(np.float32) / 255.0
+    # sym_rgba is BGRA (OpenCV convention after cv2.imdecode)
+    rgb   = patch[:, :, :3].astype(np.float32)
+    roi   = canvas_bgr[dy0:dy1, dx0:dx1].astype(np.float32)
+    canvas_bgr[dy0:dy1, dx0:dx1] = (rgb * alpha + roi * (1 - alpha)).clip(0, 255).astype(np.uint8)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HILL EQUATION  (concentration-efficacy curve)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def hill(x: np.ndarray, bottom: float, top: float,
+         ec50: float, n: float) -> np.ndarray:
+    return bottom + (top - bottom) / (1.0 + (ec50 / x) ** n)
+
+
+def make_series_x(n_pts: int, log_min: float = -15.0,
+                  log_max: float = -7.0) -> np.ndarray:
+    """Equally log-spaced x-coordinates."""
+    return np.logspace(log_min, log_max, n_pts)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SYNTHETIC PLOT GENERATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _log_to_px(log_x: float, log_min: float, log_max: float, W: int) -> int:
+    frac = (log_x - log_min) / (log_max - log_min)
+    return int(round(frac * (W - 1)))
+
+
+def _y_to_px(y: float, y_min: float, y_max: float, H: int) -> int:
+    frac = (y - y_min) / (y_max - y_min)
+    return int(round((1.0 - frac) * (H - 1)))
+
+
+def generate_one_plot(args_tuple):
     """
-    Alpha-composite sym_rgba (RGBA) onto canvas_rgb (RGB, white background)
-    centred at (cx, cy).  Transparent pixels in sym_rgba leave the canvas
-    unchanged — so lines drawn beneath open symbols remain visible.
+    Worker function for multiprocessing.
+    Returns (img_path, gt_path).
     """
-    H, W = canvas_rgb.shape[:2]
-    sh, sw = sym_rgba.shape[:2]
-    hh, hw = sh // 2, sw // 2
+    idx, out_dir, seed = args_tuple
+    rng    = random.Random(seed)
+    np_rng = np.random.default_rng(seed)
 
-    # Source region within sym_rgba
-    sx1 = max(0, -( cx - hw));  sy1 = max(0, -(cy - hh))
-    sx2 = sw - max(0, (cx + hw + (sw % 2)) - W)
-    sy2 = sh - max(0, (cy + hh + (sh % 2)) - H)
-    # Destination region on canvas
-    dx1 = max(0, cx - hw);  dy1 = max(0, cy - hh)
-    dx2 = dx1 + (sx2 - sx1)
-    dy2 = dy1 + (sy2 - sy1)
+    W, H = PLOT_W, PLOT_H
+    LOG_MIN, LOG_MAX = -15.0, -7.0
+    Y_MIN, Y_MAX = 0.0, 1.05
 
-    if dx2 <= dx1 or dy2 <= dy1:
-        return
+    # --- canvas (white background) ---
+    canvas = np.full((H, W, 3), 255, dtype=np.uint8)
 
-    src_rgb = sym_rgba[sy1:sy2, sx1:sx2, :3].astype(np.float32)
-    alpha   = sym_rgba[sy1:sy2, sx1:sx2,  3].astype(np.float32) / 255.0
-    dst     = canvas_rgb[dy1:dy2, dx1:dx2].astype(np.float32)
+    # --- plotting area margins ---
+    margin_l, margin_r = 40, 20
+    margin_b, margin_t = 30, 20
+    pa_x0, pa_y0 = margin_l, margin_t
+    pa_x1, pa_y1 = W - margin_r, H - margin_b
+    pa_w = pa_x1 - pa_x0
+    pa_h = pa_y1 - pa_y0
+    cv2.rectangle(canvas, (pa_x0, pa_y0), (pa_x1, pa_y1), (0, 0, 0), 1)
 
-    alpha3  = alpha[:, :, np.newaxis]
-    blended = src_rgb * alpha3 + dst * (1.0 - alpha3)
-    canvas_rgb[dy1:dy2, dx1:dx2] = np.clip(blended, 0, 255).astype(np.uint8)
+    # --- generate 11 series ---
+    gt_points = []
+    z_order   = list(range(N_SYMBOLS))
+    rng.shuffle(z_order)
 
+    # pre-render all symbols using matplotlib default markers
+    sym_imgs = [render_symbol(si, SYMBOL_DIAM) for si in range(N_SYMBOLS)]
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  PART 2 — SYNTHETIC PLOT GENERATION  (parallelised)
-# ═══════════════════════════════════════════════════════════════════════════
+    # generate curve parameters per series
+    series_data = []
+    for si in range(N_SYMBOLS):
+        bottom = np_rng.uniform(0.05, 0.15)
+        top    = np_rng.uniform(0.80, 1.00)
+        ec50   = 10 ** np_rng.uniform(-12, -8)
+        n_hill = np_rng.uniform(0.8, 2.5)
+        x_vals = make_series_x(N_POINTS)
+        y_vals = hill(x_vals, bottom, top, ec50, n_hill)
+        y_vals += np_rng.normal(0, 0.01, N_POINTS)
+        y_vals  = np.clip(y_vals, Y_MIN + 0.01, Y_MAX - 0.01)
+        series_data.append((x_vals, y_vals))
 
-def _sigmoid_curve(x, ec50, hill, top, bottom):
-    return bottom + (top - bottom) / (1.0 + (ec50 / (x + 1e-9)) ** hill)
+    # Step 1: draw all connecting lines (lowest z-order)
+    for si in z_order:
+        x_vals, y_vals = series_data[si]
+        pts = []
+        for xi, yi in zip(x_vals, y_vals):
+            px = pa_x0 + _log_to_px(math.log10(xi), LOG_MIN, LOG_MAX, pa_w)
+            py = pa_y0 + _y_to_px(yi, Y_MIN, Y_MAX, pa_h)
+            pts.append((px, py))
+        for k in range(len(pts) - 1):
+            cv2.line(canvas, pts[k], pts[k+1], (0, 0, 0), 1)
 
+    # Step 2: draw symbols in z-order (on top of lines)
+    for si in z_order:
+        x_vals, y_vals = series_data[si]
+        for xi, yi in zip(x_vals, y_vals):
+            px = pa_x0 + _log_to_px(math.log10(xi), LOG_MIN, LOG_MAX, pa_w)
+            py = pa_y0 + _y_to_px(yi, Y_MIN, Y_MAX, pa_h)
+            # clamp to plotting area
+            px = max(pa_x0, min(pa_x1, px))
+            py = max(pa_y0, min(pa_y1, py))
+            composite_symbol(canvas, sym_imgs[si], px, py)
+            gt_points.append({
+                "cx": px, "cy": py,
+                "class_idx": si,
+                "class_name": CLASS_NAMES[si]
+            })
 
-def _gen_plot_worker(args):
-    """Worker — picklable for multiprocessing.Pool."""
-    plot_idx, synth_dir, gt_dir = args
-    random.seed(plot_idx)
-    np.random.seed(plot_idx)
+    # add mild noise
+    noise  = np_rng.integers(0, 6, canvas.shape, dtype=np.uint8)
+    canvas = np.clip(canvas.astype(np.int16) + noise - 3, 0, 255).astype(np.uint8)
 
-    W, H   = PLOT_W, PLOT_H
-    canvas = np.full((H, W, 3), 255, dtype=np.uint8)   # white background
-    margin = HALF + SYM_RADIUS + 4
-    x_min_px, x_max_px = margin, W - margin
-    y_min_px, y_max_px = margin, H - margin
-
-    corner_densities = [random.uniform(0.0, 1.0) for _ in range(N_SERIES)]
-
-    x_log_vals = np.linspace(-3.0, 1.0, N_POINTS)
-    x_conc     = 10.0 ** x_log_vals
-
-    series_params = [
-        (random.uniform(0.05, 0.8), random.uniform(0.8, 3.0),
-         random.uniform(0.6, 1.0),  random.uniform(0.0, 0.15))
-        for _ in range(N_SERIES)
-    ]
-
-    # Compute pixel coordinates for every series
-    all_px = []
-    for si in range(N_SERIES):
-        ec50, hill, top, bot = series_params[si]
-        y = _sigmoid_curve(x_conc, ec50, hill, top, bot)
-        y += np.random.normal(0, 0.02, N_POINTS)
-        y  = np.clip(y, 0.0, 1.0)
-        px_x = np.linspace(x_min_px, x_max_px, N_POINTS).astype(int)
-        px_y = np.clip((y_max_px - y * (y_max_px - y_min_px)).astype(int),
-                       y_min_px, y_max_px)
-        all_px.append((px_x, px_y))
-
-    draw_order = list(range(N_SERIES))
-    random.shuffle(draw_order)
-
-    # ── Step 1: draw all connecting lines first (lowest z-order) ───────────
-    for si in draw_order:
-        px_x, px_y = all_px[si]
-        for i in range(len(px_x) - 1):
-            cv2.line(canvas,
-                     (int(px_x[i]),   int(px_y[i])),
-                     (int(px_x[i+1]), int(px_y[i+1])),
-                     (0, 0, 0), 1)   # black line, 1 px
-
-    # ── Step 2: composite symbols on top (randomised z-order) ──────────────
-    gt_series = []
-    for si in draw_order:
-        px_x, px_y = all_px[si]
-        sym_rgba   = render_symbol_rgba(si, size=P,
-                                        corner_density=corner_densities[si])
-        pts_gt = []
-        for i in range(N_POINTS):
-            cx_g, cy_g = int(px_x[i]), int(px_y[i])
-            composite_symbol(canvas, sym_rgba, cx_g, cy_g)
-            pts_gt.append({"px": cx_g, "py": cy_g})
-        gt_series.append({
-            "series_idx":    si,
-            "symbol_class":  si,
-            "symbol_name":   CLASS_NAMES[si],
-            "corner_density": float(corner_densities[si]),
-            "points":        pts_gt,
-        })
-
-    # Light Gaussian noise to mimic scan/print artefacts
-    noise  = np.random.normal(0, 2, canvas.shape).astype(np.int16)
-    canvas = np.clip(canvas.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-
-    img_path = Path(synth_dir) / f"plot_{plot_idx:04d}.png"
-    cv2.imwrite(str(img_path), cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
-
-    gt = {
-        "plot_idx":   plot_idx,
-        "image_path": str(img_path),
-        "image_size": {"w": W, "h": H},
-        "n_series":   N_SERIES,
-        "n_points":   N_POINTS,
-        "series":     gt_series,
-    }
-    with open(Path(gt_dir) / f"gt_{plot_idx:04d}.json", "w") as f:
-        json.dump(gt, f, indent=2)
-    return gt
+    # save
+    img_path = Path(out_dir) / f"plot_{idx:05d}.png"
+    gt_path  = Path(out_dir) / f"gt_{idx:05d}.json"
+    cv2.imwrite(str(img_path), canvas)
+    with open(gt_path, "w") as f:
+        json.dump({
+            "plot_w": W, "plot_h": H,
+            "pa": {"x0": pa_x0, "y0": pa_y0, "x1": pa_x1, "y1": pa_y1},
+            "points": gt_points
+        }, f)
+    return str(img_path), str(gt_path)
 
 
-def generate_all_plots(n_plots: int, n_workers: int = None) -> list:
-    """Generate all synthetic plots in parallel."""
-    if n_workers is None:
-        n_workers = min(16, mp.cpu_count())
-    args = [(i, str(SYNTH_DIR), str(GT_DIR)) for i in range(n_plots)]
-    print(f"  Generating {n_plots} plots using {n_workers} CPU workers ...")
-    with mp.Pool(processes=n_workers) as pool:
-        gt_list = pool.map(_gen_plot_worker, args)
-    return gt_list
+# ══════════════════════════════════════════════════════════════════════════════
+#  SUBIMAGE EXTRACTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_patch_padded(gray: np.ndarray, cx: int, cy: int,
+                         p: int = P) -> np.ndarray:
+    """Extract p×p patch centred at (cx,cy), padding with 255 if needed."""
+    half = p // 2
+    H, W = gray.shape
+    pad  = np.full((H + p, W + p), 255, dtype=np.uint8)
+    pad[half:half+H, half:half+W] = gray
+    x = cx + half; y = cy + half
+    return pad[y-half:y+half+1, x-half:x+half+1]
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  PART 3 — SUBIMAGE EXTRACTION  (3 sampling methods)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def extract_patch(img_gray: np.ndarray, cx: int, cy: int) -> np.ndarray:
-    """Extract a P×P grayscale patch centred at (cx, cy); pads with 255 (white)."""
-    H, W  = img_gray.shape
-    patch = np.full((P, P), 255, dtype=np.uint8)
-    x1, y1 = cx - HALF, cy - HALF
-    x2, y2 = x1 + P,   y1 + P
-    sx1 = max(0, -x1);  sy1 = max(0, -y1)
-    sx2 = P - max(0, x2 - W);  sy2 = P - max(0, y2 - H)
-    dx1 = max(0, x1);   dy1 = max(0, y1)
-    dx2 = min(W, x2);   dy2 = min(H, y2)
-    if dx2 > dx1 and dy2 > dy1:
-        patch[sy1:sy2, sx1:sx2] = img_gray[dy1:dy2, dx1:dx2]
-    return patch
+def patch_to_tensor(patch: np.ndarray) -> np.ndarray:
+    """Convert grayscale patch to normalised 3-channel float32 CHW."""
+    r = cv2.resize(patch, (VIT_INPUT, VIT_INPUT), interpolation=cv2.INTER_LINEAR)
+    t = np.stack([r, r, r], axis=0).astype(np.float32) / 255.0
+    return (t - _MEAN) / _STD
 
 
-def build_subimage_dataset(gt_list: list) -> tuple:
-    patches, labels = [], []
-    pos_count = [0] * N_SERIES
-    off_count = [0] * N_SERIES
+def extract_subimages(synth_dir: Path, out_dir: Path):
+    """
+    Extract subimages from all synthetic plots using 3 sampling methods.
+    Saves tensors.npy and labels.npy to out_dir.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    gt_files = sorted(synth_dir.glob("gt_*.json"))
+    print(f"  Extracting subimages from {len(gt_files)} plots...")
+
+    case1_count = 0
+    case2_count = 0
+    bg_coords_all = []
+    records = []
+
+    # --- pass 1: cases 1 and 2 ---
+    for gt_file in gt_files:
+        with open(gt_file) as f:
+            gt = json.load(f)
+        img_file = gt_file.parent / gt_file.name.replace("gt_", "plot_").replace(".json", ".png")
+        if not img_file.exists(): continue
+        gray = cv2.cvtColor(cv2.imread(str(img_file)), cv2.COLOR_BGR2GRAY)
+        pa   = gt["pa"]
+        pts  = gt["points"]
+        symbol_centers = [(p["cx"], p["cy"]) for p in pts]
+
+        for pt in pts:
+            cx, cy, ci = pt["cx"], pt["cy"], pt["class_idx"]
+            # Case 1: centred (offset < 3 px) — 2 samples per point
+            for _ in range(2):
+                ox = random.randint(-2, 2); oy = random.randint(-2, 2)
+                patch = extract_patch_padded(gray, cx+ox, cy+oy)
+                records.append((patch_to_tensor(patch), ci))
+                case1_count += 1
+            # Case 2: slightly off (3-5 px) → background label — 1 sample per point
+            angle = random.uniform(0, 2*math.pi)
+            dist  = random.uniform(3, 5)
+            ox = int(round(dist * math.cos(angle)))
+            oy = int(round(dist * math.sin(angle)))
+            patch = extract_patch_padded(gray, cx+ox, cy+oy)
+            records.append((patch_to_tensor(patch), N_SYMBOLS))  # background
+            case2_count += 1
+
+        bg_coords_all.append((gray, pa, symbol_centers))
+
+    print(f"  Case 1 (positive):      {case1_count}")
+    print(f"  Case 2 (slightly-off):  {case2_count}")
+
+    # --- pass 2: case 3 (random background) ---
+    target_bg = case1_count + case2_count
     bg_count  = 0
-
-    for gt in gt_list:
-        img_bgr = cv2.imread(gt["image_path"])
-        if img_bgr is None:
-            continue
-        img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        H, W     = img_gray.shape
-        all_centres = [(pt["px"], pt["py"])
-                       for s in gt["series"] for pt in s["points"]]
-
-        for series in gt["series"]:
-            cls = series["symbol_class"]
-            for pt in series["points"]:
-                cx, cy = pt["px"], pt["py"]
-
-                # Method 1: positive — centre within ≤2 px jitter
-                for _ in range(3):
-                    if pos_count[cls] >= PATCHES_POS:
-                        break
-                    dx = random.randint(-2, 2)
-                    dy = random.randint(-2, 2)
-                    patches.append(extract_patch(img_gray, cx+dx, cy+dy))
-                    labels.append(cls)
-                    pos_count[cls] += 1
-
-                # Method 2: slightly-off (3–5 px) → background label
-                if off_count[cls] < PATCHES_OFF:
-                    angle = random.uniform(0, 2 * math.pi)
-                    dist  = random.uniform(3, 5)
-                    ox = cx + int(round(dist * math.cos(angle)))
-                    oy = cy + int(round(dist * math.sin(angle)))
-                    patches.append(extract_patch(img_gray, ox, oy))
-                    labels.append(N_SERIES)   # background
-                    off_count[cls] += 1
-
-        # Method 3: random background — no centred symbol
-        attempts = 0
-        while bg_count < PATCHES_BG * len(gt_list) and attempts < 2000:
+    rng = random.Random(42)
+    for gray, pa, sym_centers in bg_coords_all:
+        n_needed = max(1, target_bg // len(bg_coords_all))
+        attempts = 0; added = 0
+        while added < n_needed and attempts < n_needed * 20:
             attempts += 1
-            rx = random.randint(HALF, W - HALF - 1)
-            ry = random.randint(HALF, H - HALF - 1)
-            if any(abs(rx - cx) < HALF and abs(ry - cy) < HALF
-                   for cx, cy in all_centres):
-                continue
-            patch = extract_patch(img_gray, rx, ry)
-            _, pb = cv2.threshold(patch, 200, 255, cv2.THRESH_BINARY_INV)
-            if np.sum(pb > 0) / (P * P) < 0.5:
-                patches.append(patch)
-                labels.append(N_SERIES)
-                bg_count += 1
+            cx = rng.randint(pa["x0"], pa["x1"])
+            cy = rng.randint(pa["y0"], pa["y1"])
+            too_close = any(
+                math.sqrt((cx-sx)**2 + (cy-sy)**2) < HALF + 2
+                for sx, sy in sym_centers
+            )
+            if too_close: continue
+            patch = extract_patch_padded(gray, cx, cy)
+            records.append((patch_to_tensor(patch), N_SYMBOLS))
+            bg_count += 1; added += 1
+        if bg_count >= target_bg: break
 
-    print(f"  Positive: {sum(pos_count)}  |  "
-          f"Slightly-off: {sum(off_count)}  |  "
-          f"Background: {bg_count}  |  Total: {len(patches)}")
-    return patches, labels
+    print(f"  Case 3 (random bg):     {bg_count}")
+    print(f"  Total subimages:        {len(records)}")
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  PART 4 — TENSOR CACHE
-# ═══════════════════════════════════════════════════════════════════════════
-
-_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
-_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
+    tensors = np.stack([r[0] for r in records], axis=0).astype(np.float32)
+    labels  = np.array([r[1] for r in records], dtype=np.int64)
+    np.save(str(out_dir / "tensors.npy"), tensors)
+    np.save(str(out_dir / "labels.npy"),  labels)
+    print(f"  Saved tensors.npy {tensors.shape} and labels.npy")
+    return tensors, labels
 
 
-def patches_to_tensor(patches: list) -> torch.Tensor:
-    """Convert list of (P×P) uint8 grayscale arrays → (N,3,VIT_INPUT,VIT_INPUT) float32."""
-    out = np.empty((len(patches), 3, VIT_INPUT, VIT_INPUT), dtype=np.float32)
-    for i, p in enumerate(patches):
-        r = cv2.resize(p, (VIT_INPUT, VIT_INPUT))
-        t = np.stack([r] * 3, axis=0).astype(np.float32) / 255.0
-        out[i] = (t - _MEAN) / _STD
-    return torch.from_numpy(out)
+# ══════════════════════════════════════════════════════════════════════════════
+#  DATASET
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SubimageDataset(Dataset):
+    def __init__(self, tensors: np.ndarray, labels: np.ndarray):
+        self.X = torch.from_numpy(tensors)
+        self.y = torch.from_numpy(labels)
+
+    def __len__(self):  return len(self.y)
+    def __getitem__(self, i): return self.X[i], self.y[i]
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  PART 5 — VIT MODEL
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODEL
+# ══════════════════════════════════════════════════════════════════════════════
 
-def build_model() -> nn.Module:
+def build_model(n_classes: int = N_CLASSES) -> nn.Module:
     model = timm.create_model(
-        "vit_tiny_patch16_224",
-        pretrained=True,
-        num_classes=N_CLASSES,
-        img_size=VIT_INPUT,
+        'vit_tiny_patch16_224', pretrained=True,
+        num_classes=n_classes, img_size=VIT_INPUT
     )
-    # Freeze all, then unfreeze last 3 transformer blocks + head
-    for param in model.parameters():
-        param.requires_grad = False
-    for name, param in model.named_parameters():
-        if any(f"blocks.{i}" in name for i in range(9, 12)) or \
-           "head" in name or "norm" in name:
-            param.requires_grad = True
+    # unfreeze last 4 transformer blocks + classification head
+    blocks = list(model.blocks)
+    for blk in blocks[:-4]:
+        for p in blk.parameters():
+            p.requires_grad = False
     return model
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  PART 6 — TRAINING
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  TRAINING
+# ══════════════════════════════════════════════════════════════════════════════
 
 def train(n_plots: int = N_PLOTS):
-    print("=" * 60)
-    print("STEP 1 — Generating synthetic plots (parallel)")
-    print("=" * 60)
-    gt_list = generate_all_plots(n_plots)
-    print(f"  Done. {len(gt_list)} plots saved to {SYNTH_DIR}")
-
-    print("\n" + "=" * 60)
-    print("STEP 2 — Extracting subimages (3 sampling methods)")
-    print("=" * 60)
-    patches, labels = build_subimage_dataset(gt_list)
-
-    print("\n" + "=" * 60)
-    print("STEP 3 — Building tensor cache")
-    print("=" * 60)
-    print(f"  Converting {len(patches)} patches to tensors ...")
-    X_tensor = patches_to_tensor(patches)
-    y_tensor = torch.tensor(labels, dtype=torch.long)
-    print(f"  Tensor shape: {X_tensor.shape}")
-
-    idx = list(range(len(patches)))
-    tr_idx, va_idx = train_test_split(idx, test_size=0.2,
-                                       random_state=42, stratify=labels)
-    train_ds = TensorDataset(X_tensor[tr_idx], y_tensor[tr_idx])
-    val_ds   = TensorDataset(X_tensor[va_idx], y_tensor[va_idx])
-
-    dl_kwargs = dict(
-        batch_size=BATCH_SIZE,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
-        persistent_workers=(NUM_WORKERS > 0),
-        prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
-    )
-    train_dl = DataLoader(train_ds, shuffle=True,  **dl_kwargs)
-    val_dl   = DataLoader(val_ds,   shuffle=False, **dl_kwargs)
-
-    print("\n" + "=" * 60)
-    print("STEP 4 — Training ViT  (GPU-optimised)")
-    print("=" * 60)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    print("\n" + "="*60)
+    print("STEP 1 — Generating synthetic plots")
+    print("="*60)
+    SYNTH_DIR.mkdir(parents=True, exist_ok=True)
+    existing = len(list(SYNTH_DIR.glob("plot_*.png")))
+    if existing >= n_plots:
+        print(f"  {existing} plots already exist — skipping generation.")
+    else:
+        seeds  = [random.randint(0, 2**31) for _ in range(n_plots)]
+        args   = [(i, str(SYNTH_DIR), seeds[i]) for i in range(n_plots)]
+        n_cpu  = max(1, WORKERS)
+        print(f"  Generating {n_plots} plots using {n_cpu} CPU workers...")
+        # Pre-render all symbols once in main process to populate cache
+        for si in range(N_SYMBOLS):
+            render_symbol(si, SYMBOL_DIAM)
+        t0 = time.time()
+        with mp.Pool(n_cpu) as pool:
+            results = pool.map(generate_one_plot, args)
+        print(f"  Done in {time.time()-t0:.1f}s — {len(results)} plots saved.")
+
+    print("\n" + "="*60)
+    print("STEP 2 — Extracting subimages")
+    print("="*60)
+    tensors_path = SUBIMG_DIR / "tensors.npy"
+    labels_path  = SUBIMG_DIR / "labels.npy"
+    if tensors_path.exists() and labels_path.exists():
+        print("  Loading cached subimages...")
+        tensors = np.load(str(tensors_path))
+        labels  = np.load(str(labels_path))
+        print(f"  Loaded {len(labels)} subimages.")
+    else:
+        tensors, labels = extract_subimages(SYNTH_DIR, SUBIMG_DIR)
+
+    print("\n" + "="*60)
+    print("STEP 3 — Training ViT  (GPU-optimised)")
+    print("="*60)
     print(f"  Device : {device}")
     if device.type == "cuda":
         print(f"  GPU    : {torch.cuda.get_device_name(0)}")
         print(f"  VRAM   : {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
 
+    X_tr, X_va, y_tr, y_va = train_test_split(
+        tensors, labels, test_size=0.15, random_state=42, stratify=labels
+    )
+    tr_ds = SubimageDataset(X_tr, y_tr)
+    va_ds = SubimageDataset(X_va, y_va)
+    tr_ld = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True,
+                       num_workers=WORKERS, pin_memory=(device.type=="cuda"),
+                       persistent_workers=(WORKERS > 0),
+                       prefetch_factor=4 if WORKERS > 0 else None)
+    va_ld = DataLoader(va_ds, batch_size=BATCH_SIZE, shuffle=False,
+                       num_workers=WORKERS, pin_memory=(device.type=="cuda"),
+                       persistent_workers=(WORKERS > 0),
+                       prefetch_factor=4 if WORKERS > 0 else None)
+
     model = build_model().to(device)
-
-    # torch.compile — CUDA only (CPU/Windows requires MSVC cl.exe)
-    _can_compile = (USE_COMPILE
-                    and hasattr(torch, "compile")
-                    and device.type == "cuda")
-    if _can_compile:
-        print("  Compiling model with torch.compile() ...")
-        model = torch.compile(model)
-    else:
-        print("  torch.compile() skipped (CPU or CUDA unavailable)")
-
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
     print(f"  Trainable: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
 
-    weights      = torch.ones(N_CLASSES, device=device)
-    weights[-1]  = 0.5
-    criterion    = nn.CrossEntropyLoss(weight=weights)
-    optimizer    = optim.AdamW(
+    # torch.compile — CUDA only (avoids MSVC requirement on CPU/Windows)
+    if USE_COMPILE and hasattr(torch, "compile") and device.type == "cuda":
+        print("  Compiling model with torch.compile() ...")
+        model = torch.compile(model)
+    else:
+        print("  torch.compile() skipped (CPU or CUDA unavailable / USE_COMPILE=False)")
+
+    optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=LR, weight_decay=WEIGHT_DECAY
+        lr=LR, weight_decay=1e-4
     )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-    scaler    = torch.cuda.amp.GradScaler(
-        enabled=(USE_AMP and device.type == "cuda"))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    criterion = nn.CrossEntropyLoss()
+    scaler    = GradScaler(enabled=(device.type == "cuda"))
 
-    best_val_acc = 0.0
-    best_state   = None
-    train_accs, val_accs = [], []
+    best_acc = 0.0
+    MODEL_SAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    import time
-    t0 = time.time()
-
-    for epoch in range(EPOCHS):
+    for epoch in range(1, EPOCHS + 1):
         model.train()
-        tc = tt = 0
-        for xb, yb in train_dl:
+        tr_loss = tr_correct = tr_total = 0
+        for xb, yb in tr_ld:
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(
-                    enabled=(USE_AMP and device.type == "cuda")):
+            with autocast(enabled=(device.type == "cuda")):
                 out  = model(xb)
                 loss = criterion(out, yb)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            tc += (out.argmax(1) == yb).sum().item()
-            tt += len(xb)
+            tr_loss    += loss.item() * len(yb)
+            tr_correct += (out.argmax(1) == yb).sum().item()
+            tr_total   += len(yb)
         scheduler.step()
 
         model.eval()
-        vc = vt = 0
+        va_correct = va_total = 0
         with torch.no_grad():
-            for xb, yb in val_dl:
+            for xb, yb in va_ld:
                 xb = xb.to(device, non_blocking=True)
                 yb = yb.to(device, non_blocking=True)
-                with torch.cuda.amp.autocast(
-                        enabled=(USE_AMP and device.type == "cuda")):
+                with autocast(enabled=(device.type == "cuda")):
                     out = model(xb)
-                vc += (out.argmax(1) == yb).sum().item()
-                vt += len(xb)
+                va_correct += (out.argmax(1) == yb).sum().item()
+                va_total   += len(yb)
+        va_acc = va_correct / va_total
 
-        ta = tc / tt;  va = vc / vt
-        train_accs.append(ta);  val_accs.append(va)
+        if va_acc > best_acc:
+            best_acc = va_acc
+            save_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+            torch.save(save_model.state_dict(), str(MODEL_SAVE_PATH))
 
-        if va > best_val_acc:
-            best_val_acc = va
-            raw = model._orig_mod if hasattr(model, "_orig_mod") else model
-            best_state = {k: v.clone() for k, v in raw.state_dict().items()}
+        if epoch % 5 == 0 or epoch == 1:
+            print(f"  Epoch {epoch:3d}/{EPOCHS} | "
+                  f"loss={tr_loss/tr_total:.4f} | "
+                  f"val_acc={va_acc:.4f} | best={best_acc:.4f}")
 
-        if (epoch + 1) % 5 == 0:
-            print(f"  Epoch {epoch+1:3d}/{EPOCHS}:  "
-                  f"train={ta:.4f}  val={va:.4f}  "
-                  f"best={best_val_acc:.4f}  "
-                  f"elapsed={time.time()-t0:.0f}s")
-
-    # Save best weights
-    raw = model._orig_mod if hasattr(model, "_orig_mod") else model
-    raw.load_state_dict(best_state)
-    torch.save(best_state, str(MODEL_PATH))
-    print(f"\n  Best val_acc = {best_val_acc:.4f}")
-    print(f"  Weights saved → {MODEL_PATH}")
-    print(f"  Total training time: {time.time()-t0:.0f}s")
-
-    # Confusion matrix
-    raw.eval()
-    all_preds, all_true = [], []
-    with torch.no_grad():
-        for xb, yb in val_dl:
-            xb = xb.to(device, non_blocking=True)
-            with torch.cuda.amp.autocast(
-                    enabled=(USE_AMP and device.type == "cuda")):
-                out = raw(xb)
-            all_preds.extend(out.argmax(1).cpu().numpy())
-            all_true.extend(yb.numpy())
-    cm = confusion_matrix(all_true, all_preds)
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    axes[0].plot(train_accs, label="Train")
-    axes[0].plot(val_accs,   label="Val")
-    axes[0].axhline(best_val_acc, linestyle="--", color="green",
-                    label=f"Best={best_val_acc:.3f}")
-    axes[0].set_title("Accuracy"); axes[0].legend(); axes[0].grid(True, alpha=0.3)
-    short = [c[:7] for c in CLASS_NAMES]
-    im = axes[1].imshow(cm, cmap="Blues")
-    axes[1].set_xticks(range(N_CLASSES)); axes[1].set_yticks(range(N_CLASSES))
-    axes[1].set_xticklabels(short, rotation=45, ha="right", fontsize=7)
-    axes[1].set_yticklabels(short, fontsize=7)
-    for i in range(N_CLASSES):
-        for j in range(N_CLASSES):
-            axes[1].text(j, i, str(cm[i, j]), ha="center", va="center",
-                         fontsize=6,
-                         color="white" if cm[i, j] > cm.max()/2 else "black")
-    axes[1].set_title(f"Confusion Matrix  (val_acc={best_val_acc:.3f})")
-    plt.colorbar(im, ax=axes[1])
-    plt.tight_layout()
-    out_png = WORK_DIR / "training_results.png"
-    fig.savefig(str(out_png), dpi=110, bbox_inches="tight")
-    plt.close()
-    print(f"  Training plot → {out_png}")
+    print(f"\n  Training complete. Best val acc: {best_acc:.4f}")
+    print(f"  Model saved → {MODEL_SAVE_PATH}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  PART 7 — INFERENCE
-#  Input: path to a plotting-area image (entire image = plotting area)
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
 
-def load_model(model_path: str = str(MODEL_PATH)) -> nn.Module:
+def _load_model(model_path: str | Path) -> tuple[nn.Module, torch.device]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = build_model()
-    state  = torch.load(model_path, map_location=device)
-    model.load_state_dict(state)
-    model.eval()
-    return model.to(device)
+    m = build_model()
+    m.load_state_dict(torch.load(str(model_path), map_location=device, weights_only=True))
+    m.eval().to(device)
+    return m, device
+
+
+def _per_class_nms(dets: list[dict], radius: float) -> list[dict]:
+    """Apply NMS independently per class."""
+    by_class = defaultdict(list)
+    for d in dets: by_class[d["class_idx"]].append(d)
+    kept = []
+    for ci, cls_dets in by_class.items():
+        cls_dets = sorted(cls_dets, key=lambda x: -x["confidence"])
+        suppressed = set()
+        for i, d in enumerate(cls_dets):
+            if i in suppressed: continue
+            kept.append(d)
+            for j in range(i+1, len(cls_dets)):
+                if j in suppressed: continue
+                dist = math.sqrt((d["cx"]-cls_dets[j]["cx"])**2 +
+                                  (d["cy"]-cls_dets[j]["cy"])**2)
+                if dist < radius: suppressed.add(j)
+    return kept
+
+
+def _estimate_center(window_cx: int, window_cy: int,
+                     patch_gray: np.ndarray) -> tuple[int, int]:
+    """
+    Estimate the true symbol centre within the p×p patch via connected-component centroid.
+    """
+    _, bw = cv2.threshold(patch_gray, 180, 255, cv2.THRESH_BINARY_INV)
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(bw)
+    if n <= 1:
+        return window_cx, window_cy
+    best = max(range(1, n), key=lambda i: stats[i, cv2.CC_STAT_AREA])
+    est_cx = int(round(centroids[best][0])) - P // 2
+    est_cy = int(round(centroids[best][1])) - P // 2
+    return window_cx + est_cx, window_cy + est_cy
 
 
 def detect(image_path: str,
-           model_path: str = str(MODEL_PATH),
+           model_path: str | Path = MODEL_SAVE_PATH,
            conf_thresh: float = CONF_THRESH,
            stride: int = STRIDE,
            nms_radius: float = NMS_RADIUS,
-           save_vis: bool = True) -> list:
+           unknown_thresh: float = UNKNOWN_THRESH,
+           symbol_diam: int = SYMBOL_DIAM,
+           min_dark_frac: float = MIN_DARK_FRAC) -> list[dict]:
     """
-    Detect symbols in a plotting-area image.
-    The entire input image is treated as the plotting area.
+    Detect markers in a plotting-area image.
 
-    Returns list of dicts: {cx, cy, class_idx, class_name, confidence}
+    Parameters
+    ----------
+    image_path    : path to the plotting-area image (entire image = plotting area)
+    model_path    : path to trained weights
+    conf_thresh   : minimum confidence to keep a detection
+    stride        : sliding window stride (px)
+    nms_radius    : per-class NMS suppression radius (px)
+    unknown_thresh: if max class probability < this, label as "unknown"
+    symbol_diam   : expected symbol diameter (px)
+    min_dark_frac : minimum fraction of p×p pixels that must be dark
+
+    Returns
+    -------
+    List of dicts, each with:
+      cx, cy       — estimated symbol centre in image coordinates
+      class_idx    — 0-10 (symbol) or -1 (unknown)
+      class_name   — e.g. "filled_circle" or "unknown"
+      confidence   — softmax probability of the predicted class
     """
-    device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model   = load_model(model_path)
+    model, device = _load_model(model_path)
 
-    img_bgr = cv2.imread(image_path)
-    if img_bgr is None:
-        raise FileNotFoundError(f"Cannot read image: {image_path}")
-    img_rgb  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img_bgr  = cv2.imread(str(image_path))
     img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     H, W     = img_gray.shape
 
-    print(f"[detect] {W}×{H} px  |  p={P}  stride={stride}  "
-          f"conf≥{conf_thresh}  NMS_r={nms_radius:.1f}")
+    min_dark_pixels = int(P * P * min_dark_frac)
+    raw_dets: list[dict] = []
 
-    MIN_PIX = int(P * P * 0.04)
-    batch_coords, batch_patches = [], []
-    raw_dets = []
+    batch_coords: list[tuple[int,int]] = []
+    batch_tensors: list[np.ndarray]    = []
 
-    def _flush():
-        if not batch_patches:
-            return
-        t = torch.tensor(np.stack(batch_patches),
-                         dtype=torch.float32).to(device)
+    def flush_batch():
+        if not batch_tensors: return
+        t = torch.tensor(np.stack(batch_tensors), dtype=torch.float32).to(device)
         with torch.no_grad():
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            with autocast(enabled=(device.type == "cuda")):
                 probs = torch.softmax(model(t), dim=1).cpu().numpy()
         for (bx, by), prob in zip(batch_coords, probs):
-            ci = int(prob.argmax())
-            if ci < N_SERIES and prob[ci] >= conf_thresh:
-                raw_dets.append((bx, by, ci, float(prob[ci])))
-        batch_coords.clear(); batch_patches.clear()
+            max_prob = float(prob.max())
+            ci       = int(prob.argmax())
+            if ci == N_SYMBOLS:
+                pass  # background — skip
+            elif max_prob < unknown_thresh:
+                patch = extract_patch_padded(img_gray, bx, by)
+                ecx, ecy = _estimate_center(bx, by, patch)
+                raw_dets.append({
+                    "cx": ecx, "cy": ecy,
+                    "class_idx": -1, "class_name": "unknown",
+                    "confidence": round(max_prob, 4)
+                })
+            elif max_prob >= conf_thresh:
+                patch = extract_patch_padded(img_gray, bx, by)
+                ecx, ecy = _estimate_center(bx, by, patch)
+                raw_dets.append({
+                    "cx": ecx, "cy": ecy,
+                    "class_idx": ci, "class_name": CLASS_NAMES[ci],
+                    "confidence": round(max_prob, 4)
+                })
+        batch_coords.clear(); batch_tensors.clear()
 
-    for cy in range(0, H, stride):
-        for cx in range(0, W, stride):
-            patch = extract_patch(img_gray, cx, cy)
-            _, pb = cv2.threshold(patch, 200, 255, cv2.THRESH_BINARY_INV)
-            if np.sum(pb > 0) < MIN_PIX:
-                continue
-            r = cv2.resize(patch, (VIT_INPUT, VIT_INPUT))
-            t = np.stack([r] * 3, axis=0).astype(np.float32) / 255.0
-            t = (t - _MEAN) / _STD
-            batch_coords.append((cx, cy))
-            batch_patches.append(t)
-            if len(batch_patches) == 512:
-                _flush()
-    _flush()
+    # sliding window — centre must be inside plotting area (full image)
+    for cy_w in range(0, H, stride):
+        for cx_w in range(0, W, stride):
+            patch = extract_patch_padded(img_gray, cx_w, cy_w)
+            _, bw = cv2.threshold(patch, 200, 255, cv2.THRESH_BINARY_INV)
+            if np.count_nonzero(bw) < min_dark_pixels: continue
+            batch_coords.append((cx_w, cy_w))
+            batch_tensors.append(patch_to_tensor(patch))
+            if len(batch_tensors) == 512: flush_batch()
+    flush_batch()
 
-    print(f"  Raw detections: {len(raw_dets)}")
+    # per-class NMS (unknowns handled separately)
+    symbol_dets  = [d for d in raw_dets if d["class_idx"] >= 0]
+    unknown_dets = [d for d in raw_dets if d["class_idx"] == -1]
+    kept         = _per_class_nms(symbol_dets, nms_radius)
+    unknown_kept = _per_class_nms(
+        [{**d, "class_idx": 999} for d in unknown_dets], nms_radius
+    )
+    for d in unknown_kept: d["class_idx"] = -1
 
-    # Best-of-group NMS
-    raw_dets.sort(key=lambda d: -d[3])
-    kept = []; suppressed = set()
-    for i, det in enumerate(raw_dets):
-        if i in suppressed:
-            continue
-        kept.append(det)
-        for j in range(i + 1, len(raw_dets)):
-            if j in suppressed:
-                continue
-            dist = math.sqrt((det[0]-raw_dets[j][0])**2 +
-                             (det[1]-raw_dets[j][1])**2)
-            if dist < nms_radius:
-                suppressed.add(j)
+    results = sorted(kept + unknown_kept, key=lambda d: (d["class_idx"], d["cy"], d["cx"]))
 
-    markers = [
-        {"cx": d[0], "cy": d[1],
-         "class_idx": d[2], "class_name": CLASS_NAMES[d[2]],
-         "confidence": d[3]}
-        for d in kept
-    ]
-    print(f"  After NMS: {len(markers)} markers")
-    for cls in CLASS_NAMES[:N_SERIES]:
-        cnt = sum(1 for m in markers if m["class_name"] == cls)
-        if cnt:
-            print(f"    {cls}: {cnt}")
+    found_classes = set(d["class_name"] for d in results if d["class_idx"] >= 0)
+    print(f"  Detected {len(results)} markers across {len(found_classes)} symbol type(s):")
+    for cn in sorted(found_classes):
+        n = sum(1 for d in results if d["class_name"] == cn)
+        print(f"    {cn}: {n}")
+    n_unk = sum(1 for d in results if d["class_idx"] == -1)
+    if n_unk: print(f"    unknown: {n_unk}")
 
-    if save_vis:
-        vis = img_rgb.copy()
-        for m in markers:
-            cv2.circle(vis, (m["cx"], m["cy"]), HALF, (220, 30, 30), 2)
-            cv2.putText(vis, f"{m['confidence']:.2f}",
-                        (m["cx"] + HALF + 2, m["cy"] + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, (220, 30, 30), 1)
-        vis_path = str(Path(image_path).with_suffix("")) + "_detections.png"
-        cv2.imwrite(vis_path, cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
-        print(f"  Visualisation → {vis_path}")
-
-    return markers
+    return results
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  VISUALISATION HELPER
+# ══════════════════════════════════════════════════════════════════════════════
+
+_CLASS_COLORS = {
+    "filled_circle":       (0,   0, 220),
+    "open_circle":         (0, 140, 255),
+    "filled_square":       (0, 180,   0),
+    "open_square":         (180, 200,  0),
+    "open_triangle":       (0, 200, 180),
+    "open_inv_triangle":   (0, 160, 160),
+    "filled_triangle":     (200, 100,  0),
+    "filled_inv_triangle": (180,  60,  0),
+    "open_rhombus":        (180,   0, 180),
+    "filled_rhombus":      (140,   0, 140),
+    "x_marker":            (0,   0,   0),
+    "unknown":             (128, 128, 128),
+}
+
+
+def visualise(image_path: str, detections: list[dict],
+              out_path: str | None = None) -> np.ndarray:
+    """Draw detected markers on the image and optionally save."""
+    img  = cv2.imread(str(image_path))
+    FONT = cv2.FONT_HERSHEY_SIMPLEX
+    for d in detections:
+        cx, cy = d["cx"], d["cy"]
+        cn     = d["class_name"]
+        conf   = d["confidence"]
+        color  = _CLASS_COLORS.get(cn, (100, 100, 100))
+        r      = HALF + 2
+        cv2.circle(img, (cx, cy), r, color, 1)
+        cv2.putText(img, f"{conf:.2f}", (cx + r + 1, cy + 4),
+                    FONT, 0.25, color, 1, cv2.LINE_AA)
+    if out_path:
+        cv2.imwrite(str(out_path), img)
+        print(f"  Visualisation saved → {out_path}")
+    return img
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    mp.freeze_support()   # required for multiprocessing on Windows
-
-    parser = argparse.ArgumentParser(description="Chart Marker Detector")
-    parser.add_argument("--mode",    choices=["train", "detect"], required=True)
-    parser.add_argument("--image",   type=str,   default=None)
-    parser.add_argument("--model",   type=str,   default=str(MODEL_PATH))
-    parser.add_argument("--plots",   type=int,   default=N_PLOTS)
-    parser.add_argument("--conf",    type=float, default=CONF_THRESH)
-    parser.add_argument("--stride",  type=int,   default=STRIDE)
-    parser.add_argument("--workers", type=int,   default=NUM_WORKERS,
-                        help="DataLoader worker processes (default 8)")
+    parser = argparse.ArgumentParser(description="Chart marker detector (ViT)")
+    parser.add_argument("--mode",   choices=["train", "detect"], required=True)
+    parser.add_argument("--image",  type=str, default=None,
+                        help="Path to plotting-area image (detect mode)")
+    parser.add_argument("--model",  type=str, default=str(MODEL_SAVE_PATH),
+                        help="Path to model weights")
+    parser.add_argument("--plots",  type=int, default=N_PLOTS,
+                        help="Number of synthetic plots to generate")
+    parser.add_argument("--conf",   type=float, default=CONF_THRESH)
+    parser.add_argument("--stride", type=int,   default=STRIDE)
+    parser.add_argument("--out",    type=str,   default=None,
+                        help="Output path for detection visualisation")
     args = parser.parse_args()
 
     if args.mode == "train":
-        NUM_WORKERS = args.workers
         train(n_plots=args.plots)
+
     elif args.mode == "detect":
-        if args.image is None:
-            parser.error("--image is required for --mode detect")
-        results = detect(image_path=args.image, model_path=args.model,
-                         conf_thresh=args.conf, stride=args.stride)
-        print("\nDetected markers:")
-        for m in results:
-            print(f"  ({m['cx']:4d},{m['cy']:4d})  "
-                  f"{m['class_name']:<22s}  conf={m['confidence']:.3f}")
+        if not args.image:
+            parser.error("--image is required for detect mode")
+        dets = detect(
+            image_path  = args.image,
+            model_path  = args.model,
+            conf_thresh = args.conf,
+            stride      = args.stride,
+        )
+        out_vis  = args.out or str(Path(args.image).with_suffix("")) + "_detections.png"
+        visualise(args.image, dets, out_path=out_vis)
+        out_json = str(Path(args.image).with_suffix("")) + "_markers.json"
+        with open(out_json, "w") as f:
+            json.dump({"n_detections": len(dets), "detections": dets}, f, indent=2)
+        print(f"  JSON saved → {out_json}")
