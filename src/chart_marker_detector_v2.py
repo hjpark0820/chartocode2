@@ -54,10 +54,17 @@ SYNTH_DIR       = _SRC_DIR / ".." / "data" / "synthetic_plots"
 # Subimage storage on D:\ to avoid filling C:\
 SUBIMG_DIR      = Path(r"D:\chartocode_subimages")
 
+# Per-epoch log storage on D:\
+# D:\chartocode_epoch_logs\
+#   epoch_001\
+#     train_subimages\   ← all training subimage PNGs (class_name_NNNNN.png)
+#     val_detections\    ← annotated validation plot PNGs with colour legend
+EPOCH_LOG_DIR   = Path(r"D:\chartocode_epoch_logs")
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
-N_PLOTS         = 500
+N_PLOTS         = 1000
 MARKER_PT       = 8
 DPI             = 100
 PLOT_W_IN       = 5.6
@@ -149,8 +156,8 @@ CLASS_NAMES = [
     "x_marker",             # 10
     "background",           # 11
 ]
-N_CLASSES  = len(CLASS_NAMES)
-N_SYMBOLS  = N_CLASSES - 1   # 11
+N_CLASSES  = len(CLASS_NAMES)   # 12
+N_SYMBOLS  = N_CLASSES - 1      # 11 (background is the last class)
 
 _MPL_MARKERS = [
     ('o', True),    # 0  filled_circle
@@ -222,17 +229,15 @@ def generate_one_plot(args_tuple):
     #     are never exactly co-located in the same pixel column.
 
     # --- EC50 slots (horizontal) ---
-    LOG_EC50_MIN = -14.5   # widened from -13.5 for more horizontal spread
-    LOG_EC50_MAX =  -7.5   # widened from  -8.5
+    # Narrower range (3 decades) so more curves transition at similar x-positions
+    # → higher overlap in the steep region.
+    LOG_EC50_MIN = -12.5
+    LOG_EC50_MAX = -9.5
     ec50_slot_w  = (LOG_EC50_MAX - LOG_EC50_MIN) / N_SYMBOLS
     ec50_slots   = np_rng.permutation(N_SYMBOLS)
 
-    # --- Vertical bands ---
-    # Each band spans 1/N_SYMBOLS of the [0, 1] y-range.
-    # A small intra-band margin keeps bottom/top away from band edges.
-    band_h   = 1.0 / N_SYMBOLS          # height of each band
-    band_margin = band_h * 0.10         # 10% margin inside each band
-    y_bands  = np_rng.permutation(N_SYMBOLS)  # shuffled band assignment
+    # --- No vertical band constraints ---
+    # bottom/top sampled freely from [0.02, 1.00] so curves can overlap vertically.
 
     # --- Shared nominal x-positions with tiny per-series jitter ---
     x_sub_w   = (LOG_MAX - LOG_MIN) / N_POINTS
@@ -242,19 +247,16 @@ def generate_one_plot(args_tuple):
 
     series_data = []
     for si in range(N_SYMBOLS):
-        # EC50: unique slot → sigmoid transition at a different x-position
+        # EC50: unique slot within the narrow range
         slot   = ec50_slots[si]
         log_ec = LOG_EC50_MIN + ec50_slot_w * slot + np_rng.uniform(0.05, 0.95) * ec50_slot_w
         ec50   = 10 ** log_ec
 
-        # Vertical band: bottom and top constrained to the assigned band
-        band_idx = y_bands[si]
-        band_lo  = band_idx * band_h + band_margin
-        band_hi  = (band_idx + 1) * band_h - band_margin
-        bottom   = np_rng.uniform(band_lo, band_lo + (band_hi - band_lo) * 0.3)
-        top      = np_rng.uniform(band_lo + (band_hi - band_lo) * 0.7, band_hi)
+        # bottom/top free — allows vertical overlap between series
+        bottom = np_rng.uniform(0.02, 0.20)
+        top    = np_rng.uniform(0.75, 1.00)
 
-        n_hill = np_rng.uniform(0.8, 4.0)   # wider slope range for more diversity
+        n_hill = np_rng.uniform(0.8, 4.0)
 
         # Tiny x-jitter: ±5% of sub-interval width in log space
         jitter = np_rng.uniform(-0.05, 0.05, N_POINTS) * x_sub_w
@@ -297,9 +299,7 @@ def generate_one_plot(args_tuple):
     ax.set_xscale('log')
     ax.set_xlim(10**LOG_MIN_PLOT, 10**LOG_MAX_PLOT)
     ax.set_ylim(Y_MIN_PLOT, Y_MAX_PLOT)
-    ax.tick_params(colors='black')
-    for spine in ax.spines.values():
-        spine.set_edgecolor('black')
+    ax.axis('off')   # no axes, ticks, labels or spines — plotting area only
 
     fig.tight_layout(pad=0.5)
     fig.canvas.draw()
@@ -448,42 +448,59 @@ def _extract_subimages_worker(args_tuple):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     pa   = gt["pa"]
     pts  = gt["points"]
-    sym_centers = [(p["cx"], p["cy"]) for p in pts]
-
+    sym_centers  = [(p["cx"], p["cy"]) for p in pts]
     tensors_list = []
     labels_list  = []
 
+    # Helper: returns True if any marker centre falls inside the P×P patch
+    # centred at (px, py).  A marker at (sx, sy) is inside if both
+    # |px-sx| < HALF  AND  |py-sy| < HALF  (i.e. within the patch area).
+    def _patch_contains_marker(px: int, py: int) -> bool:
+        return any(
+            abs(px - sx) < HALF and abs(py - sy) < HALF
+            for sx, sy in sym_centers
+        )
+
     for pt in pts:
         cx, cy, ci = pt["cx"], pt["cy"], pt["class_idx"]
-        # Case 1 — 2 centred samples
+        # Case 1 — 2 centred samples (symbol label)
         for _ in range(2):
             ox = rng.randint(-2, 2)
             oy = rng.randint(-2, 2)
             patch = extract_patch_padded(gray, cx + ox, cy + oy)
             tensors_list.append(patch_to_uint8(patch))
             labels_list.append(ci)
-        # Case 2 — 1 slightly-off sample (background label)
-        angle = rng.uniform(0, 2 * math.pi)
-        dist  = rng.uniform(3, 5)
-        ox = int(round(dist * math.cos(angle)))
-        oy = int(round(dist * math.sin(angle)))
-        patch = extract_patch_padded(gray, cx + ox, cy + oy)
-        tensors_list.append(patch_to_uint8(patch))
-        labels_list.append(N_SYMBOLS)
+        # Case 2 — background patch placed far enough from ALL markers so that
+        # no marker centre falls within the P×P patch area.
+        # Place the patch at distance [P*1.2, P*2.0] from this symbol in a
+        # random direction, then verify no other marker is inside it either.
+        max_tries = 20
+        for _try in range(max_tries):
+            angle = rng.uniform(0, 2 * math.pi)
+            dist  = rng.uniform(P * 1.2, P * 2.0)
+            ox = int(round(dist * math.cos(angle)))
+            oy = int(round(dist * math.sin(angle)))
+            bx2, by2 = cx + ox, cy + oy
+            if not _patch_contains_marker(bx2, by2):
+                patch = extract_patch_padded(gray, bx2, by2)
+                tensors_list.append(patch_to_uint8(patch))
+                labels_list.append(N_SYMBOLS)  # background label
+                break
+        # If no valid position found in max_tries, skip this background sample
 
-    # Case 3 — random background patches
+    # Case 3 — random background patches: patch centre must be far enough from
+    # ALL markers so that no marker centre falls within the P×P patch area.
     target_bg = len(pts) * 3
     added = attempts = 0
     while added < target_bg and attempts < target_bg * 20:
         attempts += 1
         bx = rng2.randint(pa["x0"], pa["x1"])
         by = rng2.randint(pa["y0"], pa["y1"])
-        if any(math.sqrt((bx - sx)**2 + (by - sy)**2) < HALF + 2
-               for sx, sy in sym_centers):
+        if _patch_contains_marker(bx, by):
             continue
         patch = extract_patch_padded(gray, bx, by)
         tensors_list.append(patch_to_uint8(patch))
-        labels_list.append(N_SYMBOLS)
+        labels_list.append(N_SYMBOLS)  # background label
         added += 1
 
     # Write chunk directly to disk — avoids sending large arrays over IPC pipe.
@@ -616,7 +633,7 @@ def build_subimage_dataset(synth_dir: Path, subimg_dir: Path,
 # Each uint8 sample = 64*64*3 = 12,288 bytes.
 # With 500 plots the full train set is ~4.1 GB — fits in one chunk.
 # Increase this if you scale up N_PLOTS later.
-CHUNK_SAMPLES = 400_000  # covers the full 500-plot train set in one pass
+CHUNK_SAMPLES = 400_000  # covers ~half the 1000-plot train set per pass (2 chunks)
 
 
 def _sorted_mmap_read(mmap_arr: np.ndarray, idx: np.ndarray) -> np.ndarray:
@@ -667,6 +684,136 @@ def build_model(n_classes: int = N_CLASSES) -> nn.Module:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  EPOCH LOGGING HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+EPOCH_LOG_SAMPLE_RATE = 0.01   # fraction of subimages / val plots to save
+
+
+def _save_epoch_subimages(
+        epoch: int,
+        chunk_t: torch.Tensor,   # (N, H, W, 3) uint8
+        chunk_l: torch.Tensor,   # (N,) int64
+) -> None:
+    """
+    Save a random 1% of training subimages in this chunk to:
+      D:\\chartocode_epoch_logs\\epoch_XXX\\train_subimages\\<class_name>_NNNNN.png
+
+    Each image is the 64×64 uint8 patch (grayscale stored as RGB).
+    """
+    out_dir = EPOCH_LOG_DIR / f"epoch_{epoch:03d}" / "train_subimages"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    imgs  = chunk_t.numpy()   # (N, H, W, 3) uint8
+    lbls  = chunk_l.numpy()   # (N,) int64
+    N     = len(imgs)
+    # Randomly select 1% of indices
+    rng_save = np.random.default_rng(epoch * 7919)  # deterministic per epoch
+    n_save   = max(1, int(round(N * EPOCH_LOG_SAMPLE_RATE)))
+    chosen   = rng_save.choice(N, size=n_save, replace=False)
+    class_counters: dict[int, int] = {}
+    for i in chosen:
+        ci   = int(lbls[i])
+        name = CLASS_NAMES[ci] if ci < len(CLASS_NAMES) else f"class_{ci}"
+        cnt  = class_counters.get(ci, 0)
+        class_counters[ci] = cnt + 1
+        fname = out_dir / f"{name}_{cnt:05d}.png"
+        # imgs[i] is HWC uint8 — cv2.imwrite expects BGR; since it is grayscale
+        # replicated to 3 channels, RGB == BGR, so no conversion needed.
+        cv2.imwrite(str(fname), imgs[i])
+
+
+def _legend_panel(height: int) -> np.ndarray:
+    """Build a colour-legend panel of the given height."""
+    LEGEND_W  = 200
+    ROW_H     = 22
+    PADDING   = 10
+    SWATCH_W  = 14
+    SWATCH_H  = 14
+    FONT      = cv2.FONT_HERSHEY_SIMPLEX
+    classes   = list(CLASS_NAMES[:-1]) + ["unknown"]  # exclude background
+    legend_h  = max(height, PADDING * 2 + len(classes) * ROW_H + ROW_H)
+    panel     = np.full((legend_h, LEGEND_W, 3), 245, dtype=np.uint8)
+    cv2.putText(panel, "Legend", (PADDING, PADDING + 14),
+                FONT, 0.48, (30, 30, 30), 1, cv2.LINE_AA)
+    cv2.line(panel, (PADDING, PADDING + 20),
+             (LEGEND_W - PADDING, PADDING + 20), (180, 180, 180), 1)
+    for i, cls_name in enumerate(classes):
+        y_top = PADDING + ROW_H + i * ROW_H
+        color = _CLASS_COLORS.get(cls_name, (100, 100, 100))
+        sx0 = PADDING; sy0 = y_top + (ROW_H - SWATCH_H) // 2
+        sx1 = sx0 + SWATCH_W; sy1 = sy0 + SWATCH_H
+        cv2.rectangle(panel, (sx0, sy0), (sx1, sy1), color, -1)
+        cv2.rectangle(panel, (sx0, sy0), (sx1, sy1), (80, 80, 80), 1)
+        cv2.putText(panel, cls_name.replace("_", " "),
+                    (sx1 + 6, y_top + ROW_H // 2 + 5),
+                    FONT, 0.40, (30, 30, 30), 1, cv2.LINE_AA)
+    return panel
+
+
+def _save_epoch_val_detections(
+        epoch: int,
+        model: nn.Module,
+        device: torch.device,
+        synth_dir: Path,
+        n_plots: int,
+) -> None:
+    """
+    Run detect() on every validation synthetic plot and save the annotated
+    image with a colour legend to:
+      D:\\chartocode_epoch_logs\\epoch_XXX\\val_detections\\plot_NNNNN.png
+
+    Validation plots are the last 15% of the sorted plot list.
+    """
+    out_dir = EPOCH_LOG_DIR / f"epoch_{epoch:03d}" / "val_detections"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Identify validation plots (last 15% of the n_plots sorted list)
+    all_plots = sorted(synth_dir.glob("plot_*.png"))[:n_plots]
+    val_start = int(len(all_plots) * 0.85)
+    val_plots = all_plots[val_start:]
+
+    # Randomly sample 1% of validation plots to save
+    rng_val = np.random.default_rng(epoch * 3571)
+    n_save  = max(1, int(round(len(val_plots) * EPOCH_LOG_SAMPLE_RATE)))
+    save_plots = list(rng_val.choice(len(val_plots), size=min(n_save, len(val_plots)),
+                                     replace=False))
+    save_set   = set(save_plots)
+
+    model.eval()
+    for idx, img_path in enumerate(val_plots):
+        if idx not in save_set:
+            continue
+        # Run sliding-window detection using the current model weights
+        dets = detect(str(img_path), model_path=None, _model=model, _device=device)
+
+        # Draw detections on the image
+        img_bgr = cv2.imread(str(img_path))
+        FONT = cv2.FONT_HERSHEY_SIMPLEX
+        for d in dets:
+            cx, cy = d["cx"], d["cy"]
+            cn     = d["class_name"]
+            conf   = d["confidence"]
+            color  = _CLASS_COLORS.get(cn, (100, 100, 100))
+            r      = HALF + 2
+            cv2.circle(img_bgr, (cx, cy), r, color, 1)
+            cv2.putText(img_bgr, f"{conf:.2f}", (cx + r + 1, cy + 4),
+                        FONT, 0.25, color, 1, cv2.LINE_AA)
+
+        # Attach legend panel
+        H_img = img_bgr.shape[0]
+        legend = _legend_panel(H_img)
+        if img_bgr.shape[0] < legend.shape[0]:
+            pad = np.full((legend.shape[0] - img_bgr.shape[0],
+                           img_bgr.shape[1], 3), 255, dtype=np.uint8)
+            img_bgr = np.vstack([img_bgr, pad])
+        combined = np.hstack([img_bgr, legend])
+        out_path = out_dir / img_path.name
+        cv2.imwrite(str(out_path), combined)
+
+    print(f"  Val detections saved → {out_dir}  ({len(save_set)}/{len(val_plots)} plots sampled)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  TRAINING
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -709,6 +856,7 @@ def train(n_plots: int = N_PLOTS):
         # Trigger rebuild if too few (incomplete) OR too many (n_plots was reduced).
         try:
             n_saved = np.load(str(l_path), mmap_mode='r').shape[0]
+            # 2 symbol + ~4 background samples per point
             expected_min = n_plots * N_POINTS * N_SYMBOLS * 2
             expected_max = n_plots * N_POINTS * N_SYMBOLS * 6 + n_plots * 100
             if n_saved < expected_min * 0.9:
@@ -849,47 +997,87 @@ def train(n_plots: int = N_PLOTS):
                 _pbar(batch_global, n_tr_batches, epoch_t0,
                       prefix=f"Epoch {epoch:3d}/{EPOCHS} train: ")
 
+            # Save all training subimages for this chunk to D:\chartocode_epoch_logs
+            _save_epoch_subimages(epoch, chunk_t, chunk_l)
+
             del chunk_t, chunk_l, chunk_ds, chunk_ld  # free RAM before next chunk
 
         scheduler.step()
 
         # ── Validation ────────────────────────────────────────────────────────
         model.eval()
-        va_correct = va_total = 0
         val_t0 = time.time()
+        # Collect all predictions and ground-truth labels for F1 computation
+        all_preds = []
+        all_trues = []
         with torch.no_grad():
             for bi, (xb_u8, yb) in enumerate(va_ld, 1):
                 xb = uint8_batch_to_tensor(xb_u8.numpy(), device)
                 yb = yb.to(device, non_blocking=True)
                 with autocast(enabled=(device.type == "cuda")):
                     out = model(xb)
-                va_correct += (out.argmax(1) == yb).sum().item()
-                va_total   += len(yb)
+                preds = out.argmax(1).cpu().numpy()
+                trues = yb.cpu().numpy()
+                all_preds.append(preds)
+                all_trues.append(trues)
                 _pbar(bi, n_va_batches, val_t0,
                       prefix=f"Epoch {epoch:3d}/{EPOCHS} val:   ")
-        va_acc = va_correct / va_total
 
-        improved = va_acc > best_acc
+        all_preds = np.concatenate(all_preds)
+        all_trues = np.concatenate(all_trues)
+
+        # Macro F1: average F1 over all classes (penalises FP and FN equally)
+        # Compute per-class TP, FP, FN
+        per_f1 = []
+        for c in range(N_CLASSES):
+            tp = int(((all_preds == c) & (all_trues == c)).sum())
+            fp = int(((all_preds == c) & (all_trues != c)).sum())
+            fn = int(((all_preds != c) & (all_trues == c)).sum())
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+            per_f1.append(f1)
+        macro_f1 = float(np.mean(per_f1))
+        # Keep symbol-only macro F1 (exclude background class index N_SYMBOLS)
+        sym_f1   = float(np.mean(per_f1[:N_SYMBOLS]))
+
+        improved = macro_f1 > best_acc
         if improved:
-            best_acc = va_acc
+            best_acc = macro_f1
             no_improve_epochs = 0
             save_model = model._orig_mod if hasattr(model, "_orig_mod") else model
             torch.save(save_model.state_dict(), str(MODEL_SAVE_PATH))
         else:
             no_improve_epochs += 1
 
+        # Save validation detection visualisations for this epoch
+        _save_epoch_val_detections(
+            epoch,
+            model._orig_mod if hasattr(model, "_orig_mod") else model,
+            device,
+            SYNTH_DIR,
+            n_plots,
+        )
+
         epoch_elapsed = time.time() - epoch_t0
         stop_info = (f"  [no improvement {no_improve_epochs}/{EARLY_STOP_PATIENCE}]"
                      if not improved else "  [saved]")
         print(f"  Epoch {epoch:3d}/{EPOCHS} | "
               f"loss={tr_loss/tr_total:.4f} | "
-              f"val_acc={va_acc:.4f} | best={best_acc:.4f} | "
+              f"macro_f1={macro_f1:.4f} | sym_f1={sym_f1:.4f} | best={best_acc:.4f} | "
               f"{epoch_elapsed:.0f}s{stop_info}")
 
+        # Every 5 epochs print per-class F1 breakdown
+        if epoch % 5 == 0 or improved:
+            print("  Per-class F1:")
+            for c, (name, f1) in enumerate(zip(CLASS_NAMES, per_f1)):
+                bar = '█' * int(f1 * 20)
+                print(f"    {name:<22s} {f1:.3f}  |{bar:<20s}|")
+
         if no_improve_epochs >= EARLY_STOP_PATIENCE:
-            print(f"\n  Early stopping: val_acc did not improve for "
+            print(f"\n  Early stopping: macro_f1 did not improve for "
                   f"{EARLY_STOP_PATIENCE} consecutive epochs.")
-            print(f"  Best val_acc = {best_acc:.4f} (saved at earlier epoch)")
+            print(f"  Best macro_f1 = {best_acc:.4f} (saved at earlier epoch)")
             break
 
     del t_mmap, l_mmap
@@ -952,7 +1140,9 @@ def detect(image_path: str,
            stride: int = STRIDE,
            unknown_thresh: float = UNKNOWN_THRESH,
            min_dark_frac: float = MIN_DARK_FRAC,
-           p: int = None) -> list[dict]:
+           p: int = None,
+           _model: nn.Module = None,
+           _device: torch.device = None) -> list[dict]:
     """
     Detect markers in a plotting-area image.
 
@@ -979,7 +1169,10 @@ def detect(image_path: str,
     half = p // 2
     nms_radius = p * NMS_RADIUS_FACTOR
 
-    model, device = _load_model(model_path)
+    if _model is not None and _device is not None:
+        model, device = _model, _device
+    else:
+        model, device = _load_model(model_path)
 
     img_bgr  = cv2.imread(str(image_path))
     img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -1000,8 +1193,8 @@ def detect(image_path: str,
         for (bx, by), prob in zip(batch_coords, probs):
             max_prob = float(prob.max())
             ci       = int(prob.argmax())
-            if ci == N_SYMBOLS:
-                pass
+            if ci == N_SYMBOLS:          # background — skip
+                continue
             elif max_prob < unknown_thresh:
                 patch = extract_patch_padded(img_gray, bx, by, p)
                 ecx, ecy = _estimate_center_in_patch(bx, by, patch, p)
