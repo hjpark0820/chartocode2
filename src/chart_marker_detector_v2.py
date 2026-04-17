@@ -93,7 +93,8 @@ def _compute_p_at_import() -> tuple[int, int]:
     _, bw = _cv2.threshold(gray, 200, 255, _cv2.THRESH_BINARY_INV)
     coords = _np.argwhere(bw > 0)
     diam = int(max(coords.max(axis=0) - coords.min(axis=0)) + 1) if len(coords) else MARKER_PT
-    p    = int(_math.ceil(diam * 1.20)) | 1
+    # Account for max size variation (1.20) + margin (1.20)
+    p    = int(_math.ceil(diam * 1.20 * 1.20)) | 1
     return p, p // 2
 
 P, HALF = _compute_p_at_import()
@@ -141,7 +142,7 @@ UNKNOWN_THRESH  = 0.40
 MIN_DARK_FRAC   = 0.03
 WORKERS         = min(8, mp.cpu_count())
 
-# 11 symbol classes + background
+# 12 symbol classes + background
 CLASS_NAMES = [
     "filled_circle",        # 0
     "open_circle",          # 1
@@ -154,10 +155,11 @@ CLASS_NAMES = [
     "open_rhombus",         # 8
     "filled_rhombus",       # 9
     "x_marker",             # 10
-    "background",           # 11
+    "plus_marker",          # 11
+    "background",           # 12
 ]
-N_CLASSES  = len(CLASS_NAMES)   # 12
-N_SYMBOLS  = N_CLASSES - 1      # 11 (background is the last class)
+N_CLASSES  = len(CLASS_NAMES)   # 13
+N_SYMBOLS  = N_CLASSES - 1      # 12 (background is the last class)
 
 _MPL_MARKERS = [
     ('o', True),    # 0  filled_circle
@@ -171,10 +173,199 @@ _MPL_MARKERS = [
     ('D', False),   # 8  open_rhombus
     ('D', True),    # 9  filled_rhombus
     ('x', True),    # 10 x_marker
+    ('+', True),    # 11 plus_marker
 ]
 
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
 _STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AUGMENTATION PIPELINE (NOISE & SYMBOL VARIATION)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def add_paper_texture(img: np.ndarray, strength: float, np_rng) -> np.ndarray:
+    grain = np_rng.normal(0, strength * 30, img.shape).astype(np.float32)
+    out = img.astype(np.float32) + grain
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+def add_yellowing(img: np.ndarray, strength: float) -> np.ndarray:
+    out = img.astype(np.float32)
+    out[:, :, 0] -= strength * 40   # blue down
+    out[:, :, 1] -= strength * 10   # green slight down
+    out[:, :, 2] += strength * 20   # red up
+    out += strength * 15            # brighten slightly
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+def add_blur(img: np.ndarray, strength: float) -> np.ndarray:
+    k = max(1, int(strength * 3))
+    if k % 2 == 0: k += 1
+    return cv2.GaussianBlur(img, (k, k), strength * 0.8)
+
+def add_elastic_warp(img: np.ndarray, strength: float, np_rng) -> np.ndarray:
+    from scipy.ndimage import gaussian_filter
+    h, w = img.shape[:2]
+    sigma = 20
+    alpha = strength * 8
+    dx = gaussian_filter(np_rng.random((h, w)).astype(np.float32) * 2 - 1, sigma) * alpha
+    dy = gaussian_filter(np_rng.random((h, w)).astype(np.float32) * 2 - 1, sigma) * alpha
+    x, y = np.meshgrid(np.arange(w), np.arange(h))
+    map_x = np.clip(x + dx, 0, w - 1).astype(np.float32)
+    map_y = np.clip(y + dy, 0, h - 1).astype(np.float32)
+    return cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+def add_slight_rotation(img: np.ndarray, max_deg: float, np_rng) -> np.ndarray:
+    angle = np_rng.uniform(-max_deg, max_deg)
+    h, w = img.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+def apply_scan_noise(img: np.ndarray, level: str, np_rng) -> np.ndarray:
+    if level == 'none':
+        return img
+    if level == 'light':
+        img = add_paper_texture(img, 0.15, np_rng)
+        img = add_blur(img, 0.4)
+        return img
+    if level == 'medium':
+        img = add_yellowing(img, 0.4)
+        img = add_paper_texture(img, 0.35, np_rng)
+        img = add_blur(img, 0.8)
+        img = add_elastic_warp(img, 0.5, np_rng)
+        return img
+    if level == 'heavy':
+        img = add_yellowing(img, 0.8)
+        img = add_paper_texture(img, 0.6, np_rng)
+        img = add_blur(img, 1.2)
+        img = add_elastic_warp(img, 1.0, np_rng)
+        img = add_slight_rotation(img, 1.5, np_rng)
+        return img
+    return img
+
+def sample_marker_size(base: float, variation: float, np_rng) -> float:
+    factor = float(np_rng.uniform(1.0 - variation, 1.0 + variation))
+    return base * factor
+
+def sample_linewidth(base: float, variation: float, np_rng) -> float:
+    factor = float(np_rng.uniform(1.0 - variation, 1.0 + variation))
+    return max(0.3, base * factor)
+
+
+def round_polygon_corners(verts: np.ndarray, r: float,
+                          n_arc: int = 16) -> np.ndarray:
+    """
+    Return a dense polygon with worn, convex-rounded corners.
+
+    Each sharp vertex is replaced by a circular arc that is tangent to both
+    adjacent edges and bulges OUTWARD (convex), as if the corner tip has been
+    worn smooth.  r=0 gives the original sharp polygon; r=0.5 is the maximum
+    used in training data.
+    """
+    if r <= 0.0:
+        return verts.copy()
+    N = len(verts)
+    pts = []
+    for i in range(N):
+        A = verts[(i - 1) % N]
+        B = verts[i]
+        C = verts[(i + 1) % N]
+        BA = A - B;  len_BA = np.linalg.norm(BA)
+        BC = C - B;  len_BC = np.linalg.norm(BC)
+        if len_BA < 1e-9 or len_BC < 1e-9:
+            pts.append(B); continue
+        uBA = BA / len_BA
+        uBC = BC / len_BC
+        cos_half = np.clip(np.dot(uBA, uBC), -1.0, 1.0)
+        half_angle = np.arccos(cos_half) / 2.0
+        if half_angle < 1e-6:
+            pts.append(B); continue
+        tan_half = np.tan(half_angle)
+        if tan_half < 1e-9:
+            pts.append(B); continue
+        max_t = min(len_BA, len_BC) * 0.45 * r
+        r_arc = max_t / tan_half
+        bisector = uBA + uBC
+        bisector_len = np.linalg.norm(bisector)
+        if bisector_len < 1e-9:
+            pts.append(B); continue
+        bisector = bisector / bisector_len
+        centre = B + bisector * (r_arc / np.sin(half_angle))
+        T1 = B + uBA * max_t
+        T2 = B + uBC * max_t
+        a1 = np.arctan2(T1[1] - centre[1], T1[0] - centre[0])
+        a2 = np.arctan2(T2[1] - centre[1], T2[0] - centre[0])
+        diff = (a2 - a1) % (2 * np.pi)
+        if diff > np.pi:
+            diff -= 2 * np.pi
+        arc_angles = np.linspace(a1, a1 + diff, n_arc)
+        arc_pts = centre + r_arc * np.column_stack(
+            [np.cos(arc_angles), np.sin(arc_angles)])
+        pts.extend(arc_pts.tolist())
+    return np.array(pts)
+
+
+def _regular_polygon(n: int, angle_offset: float = 0.0) -> np.ndarray:
+    """Return (n, 2) unit-radius regular polygon vertices."""
+    angles = np.linspace(0, 2 * np.pi, n, endpoint=False) + angle_offset
+    return np.column_stack([np.cos(angles), np.sin(angles)])
+
+
+# Only squares and rhombuses go through draw_rounded_marker (corner rounding).
+# Triangles (4,5,6,7), circles (0,1), x_marker (10), plus_marker (11) are
+# all drawn by matplotlib directly with perfectly sharp native markers.
+_POLY_VERTS = {
+    2: lambda: _regular_polygon(4, angle_offset=np.pi / 4),   # filled_square
+    3: lambda: _regular_polygon(4, angle_offset=np.pi / 4),   # open_square
+    8: lambda: _regular_polygon(4, angle_offset=0.0),         # open_rhombus
+    9: lambda: _regular_polygon(4, angle_offset=0.0),         # filled_rhombus
+}
+
+# Triangle class indices — always drawn via matplotlib (sharp native markers)
+_TRIANGLE_IDXS = {4, 5, 6, 7}
+
+
+def draw_rounded_marker(ax, x_data: float, y_data: float,
+                        class_idx: int, filled: bool,
+                        r: float, ms_pt: float, lw: float,
+                        zorder: int) -> None:
+    """
+    Draw a single rounded-polygon marker at data coordinates (x_data, y_data).
+
+    The polygon is scaled so that its bounding radius (max distance from
+    centre to any point on the outline) always equals ms_pt/2 display pixels,
+    regardless of the rounding level r.  This prevents rounded polygons from
+    appearing smaller than their sharp counterparts.
+    """
+    verts = _POLY_VERTS[class_idx]()
+    pts   = round_polygon_corners(verts, r)          # rounded in unit space
+
+    # Normalise: rescale pts so that the maximum radius of the rounded shape
+    # equals 1.0 (same as the original unit polygon whose vertices sit on the
+    # unit circle).  Without this, rounding trims the corners inward and the
+    # shape appears smaller.
+    max_r_rounded = np.max(np.linalg.norm(pts, axis=1))
+    if max_r_rounded > 1e-9:
+        pts = pts / max_r_rounded   # now max radius == 1.0
+
+    # Convert the data point to display (pixel) coordinates
+    disp_centre = ax.transData.transform((x_data, y_data))
+
+    # Scale: ms_pt is the marker diameter in points; 1 pt = 1/72 inch.
+    # ax.get_figure().get_dpi() gives pixels-per-inch.
+    pt_to_px = ax.get_figure().get_dpi() / 72.0
+    radius_px = (ms_pt / 2.0) * pt_to_px
+
+    # Scale normalised polygon to radius_px and shift to display centre
+    disp_pts = pts * radius_px + disp_centre
+
+    # Convert back to data coordinates
+    data_pts = ax.transData.inverted().transform(disp_pts)
+    xs = np.append(data_pts[:, 0], data_pts[0, 0])
+    ys = np.append(data_pts[:, 1], data_pts[0, 1])
+
+    fc = 'black' if filled else 'white'
+    ax.fill(xs, ys, color=fc, zorder=zorder)
+    ax.plot(xs, ys, color='black', linewidth=lw, zorder=zorder + 0.1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -282,27 +473,82 @@ def generate_one_plot(args_tuple):
         ax.plot(x_vals, y_vals, color='black', linewidth=0.8,
                 marker='none', zorder=si)
 
-    for z, si in enumerate(z_order):
-        x_vals, y_vals = series_data[si]
-        mcode, filled  = _MPL_MARKERS[si]
-        fc = 'black' if filled else 'white'
-        ax.plot(x_vals, y_vals,
-                color='black',
-                marker=mcode,
-                markersize=MARKER_PT,
-                markerfacecolor=fc,
-                markeredgecolor='black',
-                markeredgewidth=0.8,
-                linestyle='none',
-                zorder=N_SYMBOLS + z)
+    # Sample per-series perturbation parameters once per plot.
+    #
+    # Size rule: open and filled variants of the same shape are always the
+    # same size within a plot.  Shape groups (by class index):
+    #   circle  : 0 (filled_circle),  1 (open_circle)
+    #   square  : 2 (filled_square),  3 (open_square)
+    #   triangle: 4 (open_triangle),  6 (filled_triangle)
+    #   inv_tri : 5 (open_inv_tri),   7 (filled_inv_tri)
+    #   rhombus : 8 (open_rhombus),   9 (filled_rhombus)
+    #   x       : 10 (x_marker)  -- no pair
+    #   plus    : 11 (plus_marker) -- no pair
+    #
+    # One plot-level base size is drawn from MARKER_PT ±20% so different
+    # plots still have different overall symbol sizes.  Each shape group
+    # then gets its own size sampled at ±5% from that base, shared by both
+    # the open and filled variant in the group.
+    _SHAPE_GROUPS = {
+        0: 'circle',   1: 'circle',
+        2: 'square',   3: 'square',
+        4: 'triangle', 5: 'triangle',   # all four triangle types share one size
+        6: 'triangle', 7: 'triangle',
+        8: 'rhombus',  9: 'rhombus',
+        10: 'x',
+        11: 'plus',
+    }
+    plot_base_ms = sample_marker_size(base=MARKER_PT, variation=0.20, np_rng=np_rng)
+    # One size per shape group
+    unique_groups = list(dict.fromkeys(_SHAPE_GROUPS.values()))  # preserves order
+    group_ms = {
+        g: sample_marker_size(base=plot_base_ms, variation=0.02, np_rng=np_rng)
+        for g in unique_groups
+    }
+    series_params = []
+    for si in range(N_SYMBOLS):
+        ms_pt    = group_ms[_SHAPE_GROUPS[si]]
+        lw       = sample_linewidth(base=0.8, variation=0.40, np_rng=np_rng)
+        # Triangles always sharp; circles/x/plus use matplotlib (r irrelevant)
+        r_corner = (float(np_rng.uniform(0.0, 0.5))
+                    if si in _POLY_VERTS and si not in _TRIANGLE_IDXS
+                    else 0.0)
+        series_params.append((ms_pt, lw, r_corner))
 
     ax.set_xscale('log')
     ax.set_xlim(10**LOG_MIN_PLOT, 10**LOG_MAX_PLOT)
     ax.set_ylim(Y_MIN_PLOT, Y_MAX_PLOT)
     ax.axis('off')   # no axes, ticks, labels or spines — plotting area only
-
     fig.tight_layout(pad=0.5)
-    fig.canvas.draw()
+    fig.canvas.draw()   # needed so transData is valid before drawing markers
+
+    for z, si in enumerate(z_order):
+        x_vals, y_vals = series_data[si]
+        mcode, filled  = _MPL_MARKERS[si]
+        ms_pt, lw, r_corner = series_params[si]
+        zbase = N_SYMBOLS + z * 3
+
+        if si in _POLY_VERTS:
+            # Draw each point as a rounded polygon via draw_rounded_marker
+            for xi, yi in zip(x_vals, y_vals):
+                draw_rounded_marker(ax, xi, yi,
+                                    class_idx=si, filled=filled,
+                                    r=r_corner, ms_pt=ms_pt, lw=lw,
+                                    zorder=zbase)
+        else:
+            # Circles, x_marker, plus_marker — use matplotlib directly
+            fc = 'black' if filled else 'white'
+            ax.plot(x_vals, y_vals,
+                    color='black',
+                    marker=mcode,
+                    markersize=ms_pt,
+                    markerfacecolor=fc,
+                    markeredgecolor='black',
+                    markeredgewidth=lw,
+                    linestyle='none',
+                    zorder=zbase)
+
+    fig.canvas.draw()   # final redraw with all markers in place
 
     buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
     buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))
@@ -315,6 +561,12 @@ def generate_one_plot(args_tuple):
     white_bg = np.ones_like(rgba_f[:, :, :3])
     rgb_comp = rgba_f[:, :, :3] * alpha + white_bg * (1.0 - alpha)
     img_bgr  = cv2.cvtColor((rgb_comp * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+    
+    # Apply scan noise (randomly choose level per plot)
+    noise_level = rng.choices(['none', 'light', 'medium', 'heavy'], 
+                              weights=[0.1, 0.3, 0.4, 0.2])[0]
+    img_bgr = apply_scan_noise(img_bgr, noise_level, np_rng)
+    
     H_px, W_px = img_bgr.shape[:2]
 
     # Build raw gt_points (all symbol centres)
@@ -1262,6 +1514,7 @@ _CLASS_COLORS = {
     "open_rhombus":        (180,   0, 180),
     "filled_rhombus":      (140,   0, 140),
     "x_marker":            (0,   0,   0),
+    "plus_marker":         (60,  60, 200),
     "unknown":             (128, 128, 128),
 }
 
