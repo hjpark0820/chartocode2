@@ -4,10 +4,10 @@ chart_marker_detector_v3.py
 Working directory : C:\\Users\\ziola\\OneDrive\\Documents\\GitHub\\chartocode\\src
 Model save path   : ../models/chart_marker_net_v3.pth   (relative to src/)
 
-Subimage storage  : D:\\chartocode_subimages\\
+Subimage storage  : <project>/data/subimages/
   All subimage patches are pre-generated ONCE and saved as a single
-  memory-mapped NumPy file on D:\\ to avoid slow on-the-fly rendering
-  during training.  This makes each epoch ~10-20× faster.
+  memory-mapped NumPy file alongside the project to avoid slow
+  on-the-fly rendering during training.  Each epoch is ~10-20× faster.
 
 USAGE
 -----
@@ -51,15 +51,15 @@ _SRC_DIR        = Path(__file__).parent
 MODEL_SAVE_PATH = _SRC_DIR / ".." / "models" / "chart_marker_net_v3.pth"
 SYNTH_DIR       = _SRC_DIR / ".." / "data" / "synthetic_plots"
 
-# Subimage storage on D:\ to avoid filling C:\
-SUBIMG_DIR      = Path(r"D:\chartocode_subimages")
+# Subimage storage alongside the project (same drive as source)
+SUBIMG_DIR      = _SRC_DIR / ".." / "data" / "subimages"
 
-# Per-epoch log storage on D:\
-# D:\chartocode_epoch_logs\
-#   epoch_001\
-#     train_subimages\   ← all training subimage PNGs (class_name_NNNNN.png)
-#     val_detections\    ← annotated validation plot PNGs with colour legend
-EPOCH_LOG_DIR   = Path(r"D:\chartocode_epoch_logs")
+# Per-epoch log storage alongside the project
+# <project>/data/epoch_logs/
+#   epoch_001/
+#     train_subimages/   ← sampled training subimage PNGs (class_name_NNNNN.png)
+#     val_detections/    ← annotated validation plot PNGs with colour legend
+EPOCH_LOG_DIR   = _SRC_DIR / ".." / "data" / "epoch_logs"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
@@ -136,7 +136,8 @@ LR              = 3e-4
 USE_COMPILE     = False         # disabled — hangs on some Windows/GPU combos
 CONF_THRESH     = 0.65
 STRIDE          = 2
-NMS_RADIUS_FACTOR = 1.5
+NMS_RADIUS_FACTOR = 0.75   # ≈ 14 px at P=19; suppresses duplicate windows on same
+                           # symbol without merging adjacent symbols (~15-20 px apart)
 UNKNOWN_THRESH  = 0.40
 MIN_DARK_FRAC   = 0.03
 WORKERS         = min(8, mp.cpu_count())
@@ -569,9 +570,13 @@ def generate_one_plot(args_tuple):
     H_px, W_px = img_bgr.shape[:2]
 
     # Build raw gt_points (all symbol centres)
-    raw_points = []
+    # Build raw_points (all symbol centres, in series order) and
+    # series_pixels (ordered pixel sequences per series for GT segments).
+    raw_points: list = []
+    series_pixels: list = []   # list of lists: series_pixels[si] = [{cx,cy}, ...]
     for si in range(N_SYMBOLS):
         x_vals, y_vals = series_data[si]
+        sp: list = []
         for xi, yi in zip(x_vals, y_vals):
             disp = ax.transData.transform((xi, yi))
             px = int(round(disp[0]))
@@ -581,6 +586,8 @@ def generate_one_plot(args_tuple):
             raw_points.append({"cx": px, "cy": py,
                                "class_idx": si,
                                "class_name": CLASS_NAMES[si]})
+            sp.append({"cx": px, "cy": py})
+        series_pixels.append(sp)
 
     # Minimum-distance filter: drop any point whose centre is within
     # MIN_SEP pixels of an already-accepted point.  This removes the
@@ -610,11 +617,39 @@ def generate_one_plot(args_tuple):
     img_path = Path(out_dir) / f"plot_{idx:05d}.png"
     gt_path  = Path(out_dir) / f"gt_{idx:05d}.json"
     cv2.imwrite(str(img_path), img_bgr)
+    # Build a set of accepted (cx, cy) for fast lookup
+    accepted_set = {(pt["cx"], pt["cy"]) for pt in gt_points}
+
+    # GT segments: connect ALL consecutive pairs within each series.
+    # The MIN_SEP filter is only for selecting clean ViT subimage patches;
+    # it must NOT gate segment GT — every rendered line should be covered.
+    MIN_SEG_LEN_PX = 5.0
+    gt_segments: list = []
+    for si, sp in enumerate(series_pixels):
+        for i in range(len(sp) - 1):
+            p0, p1 = sp[i], sp[i + 1]
+            length = math.hypot(p1["cx"] - p0["cx"], p1["cy"] - p0["cy"])
+            if length >= MIN_SEG_LEN_PX:
+                gt_segments.append({
+                    "x1": p0["cx"], "y1": p0["cy"],
+                    "x2": p1["cx"], "y2": p1["cy"],
+                    "series_idx": si,
+                    "length": round(length, 2),
+                })
+
     with open(gt_path, "w") as f:
         json.dump({
             "plot_w": W_px, "plot_h": H_px,
             "pa": {"x0": pa_x0, "y0": pa_y0, "x1": pa_x1, "y1": pa_y1},
-            "points": gt_points
+            "points": gt_points,
+            # all_points: every rendered symbol (before MIN_SEP filter).
+            # Used by the background-patch sampler.
+            "all_points": raw_points,
+            # series_pixels: ordered pixel sequences for each series.
+            # Used by segment detectors to derive correct GT segments.
+            "series_pixels": series_pixels,
+            # segments: GT line segments (both endpoints survived MIN_SEP).
+            "segments": gt_segments,
         }, f)
     return str(img_path), str(gt_path)
 
@@ -625,7 +660,8 @@ def generate_one_plot(args_tuple):
 
 def extract_patch_padded(gray: np.ndarray, cx: int, cy: int,
                          p: int = None) -> np.ndarray:
-    """Extract p×p patch centred at (cx, cy), padding with 255 at borders."""
+    """Extract p×p patch centred at (cx, cy), padding with 255 at borders.
+    Always returns exactly p×p — any arithmetic edge cases are cropped."""
     if p is None: p = P
     half = p // 2
     H, W = gray.shape
@@ -638,7 +674,8 @@ def extract_patch_padded(gray: np.ndarray, cx: int, cy: int,
     patch = np.full((p, p), 255, dtype=np.uint8)
     if sx1 > sx0 and sy1 > sy0:
         patch[dy0:dy1, dx0:dx1] = gray[sy0:sy1, sx0:sx1]
-    return patch
+    # Strict size guarantee: crop to exactly p×p in case of any off-by-one
+    return patch[:p, :p]
 
 
 def patch_to_tensor(patch: np.ndarray) -> np.ndarray:
@@ -699,16 +736,26 @@ def _extract_subimages_worker(args_tuple):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     pa   = gt["pa"]
     pts  = gt["points"]
-    sym_centers  = [(p["cx"], p["cy"]) for p in pts]
+    # Use all_points (every rendered symbol, before MIN_SEP filter) for the
+    # exclusion check so that dropped symbols — still visible in the image —
+    # are also excluded from background patches.
+    all_pts = gt.get("all_points", pts)  # fallback to pts for old GT files
+    sym_centers  = [(p["cx"], p["cy"]) for p in all_pts]
     tensors_list = []
     labels_list  = []
 
-    # Helper: returns True if any marker centre falls inside the P×P patch
-    # centred at (px, py).  A marker at (sx, sy) is inside if both
-    # |px-sx| < HALF  AND  |py-sy| < HALF  (i.e. within the patch area).
+    # Helper: returns True if the background patch centred at (px, py) would
+    # contain any symbol centre.
+    #
+    # Uses Chebyshev (L∞) distance: max(|dx|, |dy|) < t.
+    # This matches the square patch geometry exactly — a symbol centre at
+    # (sx, sy) is inside the P×P patch iff max(|px-sx|,|py-sy|) < HALF.
+    # t = P/2 = HALF: the exclusion boundary exactly coincides with the
+    # patch edge, so no symbol centre can appear inside a background patch.
+    _EXCL = P / 2   # t = P/2 = HALF  (≈ 9.5 px at P=19)
     def _patch_contains_marker(px: int, py: int) -> bool:
         return any(
-            abs(px - sx) < HALF and abs(py - sy) < HALF
+            max(abs(px - sx), abs(py - sy)) < _EXCL
             for sx, sy in sym_centers
         )
 
@@ -721,14 +768,15 @@ def _extract_subimages_worker(args_tuple):
             patch = extract_patch_padded(gray, cx + ox, cy + oy)
             tensors_list.append(patch_to_uint8(patch))
             labels_list.append(ci)
-        # Case 2 — background patch placed far enough from ALL markers so that
-        # no marker centre falls within the P×P patch area.
-        # Place the patch at distance [P*1.2, P*2.0] from this symbol in a
-        # random direction, then verify no other marker is inside it either.
+        # Case 2 — background patch placed near this marker but strictly far
+        # enough from ALL markers so that no symbol centre falls within the patch.
+        # Exclusion radius is _EXCL = P.  We sample from [P*1.05, P*2.0]
+        # to stay just outside the exclusion zone while remaining close to the
+        # symbol (providing useful near-symbol background context).
         max_tries = 20
         for _try in range(max_tries):
             angle = rng.uniform(0, 2 * math.pi)
-            dist  = rng.uniform(P * 1.2, P * 2.0)
+            dist  = rng.uniform(_EXCL * 1.05, P * 2.0)
             ox = int(round(dist * math.cos(angle)))
             oy = int(round(dist * math.sin(angle)))
             bx2, by2 = cx + ox, cy + oy
@@ -739,8 +787,8 @@ def _extract_subimages_worker(args_tuple):
                 break
         # If no valid position found in max_tries, skip this background sample
 
-    # Case 3 — random background patches: patch centre must be far enough from
-    # ALL markers so that no marker centre falls within the P×P patch area.
+    # Case 3 — random background patches: patch centre must be at least _EXCL
+    # pixels from every symbol centre (guaranteed by _patch_contains_marker).
     target_bg = len(pts) * 3
     added = attempts = 0
     while added < target_bg and attempts < target_bg * 20:
@@ -948,7 +996,7 @@ def _save_epoch_subimages(
 ) -> None:
     """
     Save a random 1% of training subimages in this chunk to:
-      D:\\chartocode_epoch_logs\\epoch_XXX\\train_subimages\\<class_name>_NNNNN.png
+      <project>/data/epoch_logs/epoch_XXX/train_subimages/<class_name>_NNNNN.png
 
     Each image is the 64×64 uint8 patch (grayscale stored as RGB).
     """
@@ -1011,7 +1059,7 @@ def _save_epoch_val_detections(
     """
     Run detect() on every validation synthetic plot and save the annotated
     image with a colour legend to:
-      D:\\chartocode_epoch_logs\\epoch_XXX\\val_detections\\plot_NNNNN.png
+      <project>/data/epoch_logs/epoch_XXX/val_detections/plot_NNNNN.png
 
     Validation plots are the last 15% of the sorted plot list.
     """
@@ -1061,6 +1109,70 @@ def _save_epoch_val_detections(
         out_path = out_dir / img_path.name
         cv2.imwrite(str(out_path), combined)
 
+        # Compute per-plot detection metrics against ground truth
+        gt_path = img_path.parent / img_path.name.replace("plot_", "gt_").replace(".png", ".json")
+        if gt_path.exists():
+            with open(gt_path) as f:
+                gt = json.load(f)
+            
+            # Ground truth points by class
+            gt_by_cls = {c: [] for c in range(N_SYMBOLS)}
+            for pt in gt["points"]:
+                if 0 <= pt["class_idx"] < N_SYMBOLS:
+                    gt_by_cls[pt["class_idx"]].append((pt["cx"], pt["cy"]))
+            
+            # Detected points by class
+            det_by_cls = {c: [] for c in range(N_SYMBOLS)}
+            for d in dets:
+                if 0 <= d["class_idx"] < N_SYMBOLS:
+                    det_by_cls[d["class_idx"]].append((d["cx"], d["cy"]))
+            
+            # Match detections to GT (greedy distance matching within MIN_SEP)
+            MIN_SEP = int(round(P * 1.5))
+            plot_metrics = []
+            
+            for c in range(N_SYMBOLS):
+                gts = list(gt_by_cls[c])
+                dts = list(det_by_cls[c])
+                
+                tp = 0
+                for dx, dy in dts:
+                    best_dist = float('inf')
+                    best_gi = -1
+                    for gi, (gx, gy) in enumerate(gts):
+                        dist = math.hypot(dx - gx, dy - gy)
+                        if dist < best_dist and dist < MIN_SEP:
+                            best_dist = dist
+                            best_gi = gi
+                    if best_gi >= 0:
+                        tp += 1
+                        gts.pop(best_gi)  # matched, remove from pool
+                
+                fp = len(dts) - tp
+                fn = len(gt_by_cls[c]) - tp
+                # For per-plot detection, TN is not well-defined, leave as 0 or N/A
+                tn = 0
+                
+                prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+                
+                plot_metrics.append({
+                    "class": CLASS_NAMES[c],
+                    "TP": tp, "FP": fp, "FN": fn,
+                    "precision": prec, "recall": rec, "f1": f1
+                })
+            
+            # Save per-plot CSV (skip silently if the file is locked, e.g. open in Excel)
+            csv_path = out_dir / img_path.name.replace(".png", "_metrics.csv")
+            try:
+                with open(csv_path, "w", encoding="utf-8") as f:
+                    f.write("class,TP,FP,FN,precision,recall,f1\n")
+                    for row in plot_metrics:
+                        f.write(f"{row['class']},{row['TP']},{row['FP']},{row['FN']},{row['precision']:.4f},{row['recall']:.4f},{row['f1']:.4f}\n")
+            except PermissionError:
+                print(f"  [warn] Could not write {csv_path.name} — file may be open in another program.")
+
     print(f"  Val detections saved → {out_dir}  ({len(save_set)}/{len(val_plots)} plots sampled)")
 
 
@@ -1095,7 +1207,7 @@ def train(n_plots: int = N_PLOTS):
 
     # ── STEP 2: pre-generate subimage patches (once) ──────────────────────────
     print("\n" + "="*60)
-    print("STEP 2 — Pre-generating subimage patches → D:\\chartocode_subimages\\")
+    print(f"STEP 2 — Pre-generating subimage patches → {SUBIMG_DIR}")
     print("="*60)
 
     # Check if we need to rebuild (e.g. number of plots changed)
@@ -1277,16 +1389,24 @@ def train(n_plots: int = N_PLOTS):
         all_trues = np.concatenate(all_trues)
 
         # Macro F1: average F1 over all classes (penalises FP and FN equally)
-        # Compute per-class TP, FP, FN
+        # Compute per-class TP, FP, FN, TN
         per_f1 = []
+        metrics_table = []
         for c in range(N_CLASSES):
             tp = int(((all_preds == c) & (all_trues == c)).sum())
             fp = int(((all_preds == c) & (all_trues != c)).sum())
             fn = int(((all_preds != c) & (all_trues == c)).sum())
+            tn = int(((all_preds != c) & (all_trues != c)).sum())
             prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
             rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
             f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
             per_f1.append(f1)
+            metrics_table.append({
+                "class": CLASS_NAMES[c],
+                "TP": tp, "FP": fp, "FN": fn, "TN": tn,
+                "precision": prec, "recall": rec, "f1": f1
+            })
+            
         macro_f1 = float(np.mean(per_f1))
         # Keep symbol-only macro F1 (exclude background class index N_SYMBOLS)
         sym_f1   = float(np.mean(per_f1[:N_SYMBOLS]))
@@ -1313,12 +1433,67 @@ def train(n_plots: int = N_PLOTS):
               f"macro_f1={macro_f1:.4f} | sym_f1={sym_f1:.4f} | best={best_acc:.4f} | "
               f"{epoch_elapsed:.0f}s{stop_info}")
 
-        # Every 5 epochs print per-class F1 breakdown
-        if epoch % 5 == 0 or improved:
-            print("  Per-class F1:")
-            for c, (name, f1) in enumerate(zip(CLASS_NAMES, per_f1)):
-                bar = '█' * int(f1 * 20)
-                print(f"    {name:<22s} {f1:.3f}  |{bar:<20s}|")
+        # Save per-class metrics to CSV
+        # Columns: class, TP, FP, FN, TN,
+        #          TP+FP (prec denom), TP+FN (rec denom),
+        #          precision = TP/(TP+FP), recall = TP/(TP+FN),
+        #          2*P*R (F1 numerator), P+R (F1 denominator), F1 = 2PR/(P+R)
+        csv_dir = EPOCH_LOG_DIR / f"epoch_{epoch:03d}"
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = csv_dir / "val_metrics.csv"
+        try:
+            with open(csv_path, "w", encoding="utf-8") as f:
+                f.write("class,TP,FP,FN,TN,"
+                        "TP+FP,TP+FN,"
+                        "precision=TP/(TP+FP),recall=TP/(TP+FN),"
+                        "2*P*R,P+R,F1=2PR/(P+R)\n")
+                for row in metrics_table:
+                    tp_fp = row['TP'] + row['FP']
+                    tp_fn = row['TP'] + row['FN']
+                    two_pr = 2.0 * row['precision'] * row['recall']
+                    p_plus_r = row['precision'] + row['recall']
+                    f.write(
+                        f"{row['class']},{row['TP']},{row['FP']},{row['FN']},{row['TN']},"
+                        f"{tp_fp},{tp_fn},"
+                        f"{row['precision']:.4f},{row['recall']:.4f},"
+                        f"{two_pr:.4f},{p_plus_r:.4f},{row['f1']:.4f}\n"
+                    )
+        except PermissionError:
+            print(f"  [warn] Could not write {csv_path.name} — file may be open in another program.")
+
+        # Print full metrics table to console
+        # Layout:
+        #  Class | TP | FP | FN | TN | TP+FP | TP+FN | Prec=TP/(TP+FP) | Rec=TP/(TP+FN) | 2PR | P+R | F1=2PR/(P+R)
+        hdr = (f"  {'Class':<22} | {'TP':>6} | {'FP':>6} | {'FN':>6} | {'TN':>8} "
+               f"| {'TP+FP':>7} | {'TP+FN':>7} "
+               f"| {'Prec':>7} | {'Rec':>7} "
+               f"| {'2·P·R':>7} | {'P+R':>7} | {'F1':>7}")
+        print(f"\n  Epoch {epoch} Validation Metrics:")
+        print(f"  Formula: Prec = TP/(TP+FP)   Rec = TP/(TP+FN)   F1 = 2·Prec·Rec / (Prec+Rec)")
+        print(hdr)
+        print("  " + "-" * len(hdr))
+        for row in metrics_table:
+            tp_fp = row['TP'] + row['FP']
+            tp_fn = row['TP'] + row['FN']
+            two_pr = 2.0 * row['precision'] * row['recall']
+            p_plus_r = row['precision'] + row['recall']
+            print(
+                f"  {row['class']:<22} | {row['TP']:6d} | {row['FP']:6d} | {row['FN']:6d} | {row['TN']:8d} "
+                f"| {tp_fp:7d} | {tp_fn:7d} "
+                f"| {row['precision']:7.4f} | {row['recall']:7.4f} "
+                f"| {two_pr:7.4f} | {p_plus_r:7.4f} | {row['f1']:7.4f}"
+            )
+        # Summary rows
+        print("  " + "-" * len(hdr))
+        print(f"  {'macro_f1 (all classes)':<22}   {'':>6}   {'':>6}   {'':>6}   {'':>8} "
+              f"  {'':>7}   {'':>7} "
+              f"  {'':>7}   {'':>7} "
+              f"  {'':>7}   {'':>7}   {macro_f1:7.4f}")
+        print(f"  {'sym_f1  (symbols only)':<22}   {'':>6}   {'':>6}   {'':>6}   {'':>8} "
+              f"  {'':>7}   {'':>7} "
+              f"  {'':>7}   {'':>7} "
+              f"  {'':>7}   {'':>7}   {sym_f1:7.4f}")
+        print()
 
 
     del t_mmap, l_mmap
@@ -1533,7 +1708,7 @@ def visualise(image_path: str, detections: list[dict],
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Chart marker detector (ViT)")
-    parser.add_argument("--mode",   choices=["train", "detect"], required=True)
+    parser.add_argument("--mode",   choices=["train", "detect", "generate"], required=True)
     parser.add_argument("--image",  type=str, default=None,
                         help="Path to plotting-area image (detect mode)")
     parser.add_argument("--model",  type=str, default=str(MODEL_SAVE_PATH),
@@ -1548,6 +1723,26 @@ if __name__ == "__main__":
 
     if args.mode == "train":
         train(n_plots=args.plots)
+
+    elif args.mode == "generate":
+        # Generate synthetic plots only — no subimage extraction or training.
+        # Useful for refreshing the dataset before running segment detectors.
+        n = args.plots
+        SYNTH_DIR.mkdir(parents=True, exist_ok=True)
+        existing = len(list(SYNTH_DIR.glob("plot_*.png")))
+        if existing >= n:
+            print(f"  {existing} plots already exist — nothing to do.")
+            print(f"  Delete {SYNTH_DIR} to force regeneration.")
+        else:
+            seeds = [random.randint(0, 2**31) for _ in range(n)]
+            args_list = [(i, str(SYNTH_DIR), seeds[i]) for i in range(n)]
+            n_cpu = max(1, WORKERS)
+            print(f"  Generating {n} plots using {n_cpu} CPU workers...")
+            t0 = time.time()
+            with mp.Pool(n_cpu) as pool:
+                results = pool.map(generate_one_plot, args_list)
+            print(f"  Done in {time.time()-t0:.1f}s — {len(results)} plots saved.")
+            print(f"  Output: {SYNTH_DIR}")
 
     elif args.mode == "detect":
         if not args.image:
