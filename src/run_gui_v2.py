@@ -239,6 +239,7 @@ def run_detection(img_bgr: np.ndarray,
     _img_for_vit = img_bgr
     _prep_info_for_vit = prep_info
     _eb_info_list = []
+    _diag_steps: list[dict] = []  # list of {title, img_bgr}
 
     if not has_lines:
         log_fn("[Step 1] No-lines mode: segment detection skipped.")
@@ -266,10 +267,63 @@ def run_detection(img_bgr: np.ndarray,
         mod3 = _load("segment_detector", seg_path)
         import inspect as _insp
         _seg_sig = _insp.signature(mod3.detect)
-        if 'prep_info' in _seg_sig.parameters:
-            segs = mod3.detect(img_bgr, prep_info=prep_info)
+        _seg_debug_result = None
+        if hasattr(mod3, 'detect_debug'):
+            try:
+                _seg_debug_result = mod3.detect_debug(img_bgr, prep_info=prep_info)
+                segs = _seg_debug_result['segments']
+                # Build 8-panel diagnostic image in-memory
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as _plt_seg
+                import io as _io_seg
+                _img_rgb_d = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                _fg = _seg_debug_result['fg_mask']
+                _sm = _seg_debug_result['seg_mask']
+                _clusters = _seg_debug_result['clusters']
+                _lost = (_fg > 0) & (_sm == 0)
+                _panel_lost = _img_rgb_d.copy() // 2
+                _panel_lost[_sm > 0] = [0, 220, 80]
+                _panel_lost[_lost]   = [255, 60, 60]
+                def _seg_ov(base, segs_list, color=(220,40,40)):
+                    out = base.copy()
+                    for (x1,y1,x2,y2) in segs_list:
+                        cv2.line(out,(int(x1),int(y1)),(int(x2),int(y2)),color,2)
+                        cv2.circle(out,(int(x1),int(y1)),3,color,-1)
+                        cv2.circle(out,(int(x2),int(y2)),3,color,-1)
+                    return out
+                _panels_seg = [
+                    (_img_rgb_d,                                              f"1. Input"),
+                    (np.stack([_fg*255]*3,-1).astype(np.uint8),              f"2. Foreground ({_fg.sum()} px)"),
+                    (np.stack([_sm*255]*3,-1).astype(np.uint8),              f"3. Segment mask ({_sm.sum()} px)"),
+                    (_panel_lost,                                              f"3b. Kept(green)/Lost(red)"),
+                    (_seg_ov(_img_rgb_d, _seg_debug_result['segments_raw']),  f"4. Raw ({len(_seg_debug_result['segments_raw'])})"),
+                    (_seg_ov(_img_rgb_d, _seg_debug_result['segments_grouped']), f"5. Grouped ({len(_seg_debug_result['segments_grouped'])})"),
+                    (_seg_ov(_img_rgb_d, _seg_debug_result['segments_extended']), f"6. Extended ({len(_seg_debug_result['segments_extended'])})"),
+                    (_seg_ov(_img_rgb_d, segs),                               f"7. Final ({len(segs)})"),
+                ]
+                _fig_seg, _axes_seg = _plt_seg.subplots(2, 4, figsize=(22, 12))
+                for _ax_s, (_pan, _tit) in zip(_axes_seg.flat, _panels_seg):
+                    _ax_s.imshow(_pan); _ax_s.set_title(_tit, fontsize=9); _ax_s.axis('off')
+                _plt_seg.suptitle(f"Segment Detection Pipeline  →  {len(segs)} final segments", fontsize=12, fontweight='bold')
+                _plt_seg.tight_layout()
+                _buf_seg = _io_seg.BytesIO()
+                _plt_seg.savefig(_buf_seg, dpi=120, bbox_inches='tight', format='png')
+                _plt_seg.close()
+                _buf_seg.seek(0)
+                _seg_diag_arr = cv2.imdecode(np.frombuffer(_buf_seg.read(), np.uint8), cv2.IMREAD_COLOR)
+                _diag_steps.append({'title': f'Step 1 — Segment Detection ({len(segs)} segments)', 'img_bgr': _seg_diag_arr})
+            except Exception as _seg_dbg_e:
+                log_fn(f"  [diag] detect_debug failed: {_seg_dbg_e}")
+                if 'prep_info' in _seg_sig.parameters:
+                    segs = mod3.detect(img_bgr, prep_info=prep_info)
+                else:
+                    segs = mod3.detect(img_bgr)
         else:
-            segs = mod3.detect(img_bgr)
+            if 'prep_info' in _seg_sig.parameters:
+                segs = mod3.detect(img_bgr, prep_info=prep_info)
+            else:
+                segs = mod3.detect(img_bgr)
         log_fn(f"  {len(segs)} segments detected")
 
         # ── Function 2: Error-bar stem + T-cap removal (if has_errorbars) ────
@@ -300,6 +354,35 @@ def run_detection(img_bgr: np.ndarray,
                     _stem_px = (_mask_eb.astype('uint8') - _mask_no_stem.astype('uint8')).clip(0, 1)
                     _img_no_stem[_stem_px == 1] = 255
                     _img_for_vit = _img_no_stem
+                    # Build error-bar before/after diagnostic image
+                    try:
+                        import io as _io_eb2
+                        import matplotlib.pyplot as _plt_eb2
+                        _eb_before_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                        _eb_after_rgb  = cv2.cvtColor(_img_no_stem, cv2.COLOR_BGR2RGB)
+                        # Overlay stem positions on before image
+                        _eb_before_ann = _eb_before_rgb.copy()
+                        for _ebi in _eb_info_list:
+                            _ecx = int(_ebi.get('cx', 0))
+                            _ey0 = int(_ebi.get('y_top', 0))
+                            _ey1 = int(_ebi.get('y_bot', 0))
+                            cv2.line(_eb_before_ann, (_ecx, _ey0), (_ecx, _ey1), (255, 0, 0), 2)
+                            cv2.circle(_eb_before_ann, (_ecx, _ey0), 4, (0, 255, 0) if _ebi.get('top_is_marker') else (255, 165, 0), -1)
+                            cv2.circle(_eb_before_ann, (_ecx, _ey1), 4, (0, 255, 0) if _ebi.get('bot_is_marker') else (255, 165, 0), -1)
+                        _fig_eb, _axes_eb = _plt_eb2.subplots(1, 3, figsize=(18, 6))
+                        _axes_eb[0].imshow(_eb_before_rgb);     _axes_eb[0].set_title('Before removal', fontsize=10); _axes_eb[0].axis('off')
+                        _axes_eb[1].imshow(_eb_before_ann);     _axes_eb[1].set_title(f'Stems annotated ({len(_eb_info_list)} stems)\nBlue=stem, Green=marker end, Orange=T-cap end', fontsize=9); _axes_eb[1].axis('off')
+                        _axes_eb[2].imshow(_eb_after_rgb);      _axes_eb[2].set_title('After removal (ViT input)', fontsize=10); _axes_eb[2].axis('off')
+                        _plt_eb2.suptitle(f'Step 1b — Error-bar Removal  ({len(_eb_info_list)} stems processed)', fontsize=12, fontweight='bold')
+                        _plt_eb2.tight_layout()
+                        _buf_eb = _io_eb2.BytesIO()
+                        _plt_eb2.savefig(_buf_eb, dpi=120, bbox_inches='tight', format='png')
+                        _plt_eb2.close()
+                        _buf_eb.seek(0)
+                        _eb_diag_arr = cv2.imdecode(np.frombuffer(_buf_eb.read(), np.uint8), cv2.IMREAD_COLOR)
+                        _diag_steps.append({'title': f'Step 1b — Error-bar Removal ({len(_eb_info_list)} stems)', 'img_bgr': _eb_diag_arr})
+                    except Exception as _eb_diag_e:
+                        log_fn(f"  [diag] error-bar diag failed: {_eb_diag_e}")
                     # Wrap stem-free mask into prep_info for ViT
                     _orig_clean_fn = prep_info['clean_fn']
                     def _make_sfn(sfm, ofn):
@@ -410,6 +493,44 @@ def run_detection(img_bgr: np.ndarray,
             os.unlink(tmp_path)
             kept = result2["kept"]
             log_fn(f"  {len(kept)} markers detected by ViT")
+            # Build ViT/NMS diagnostic image
+            try:
+                import io as _io_vit
+                import matplotlib.pyplot as _plt_vit
+                _suppressed = result2.get('suppressed', [])
+                _d_est_v    = result2.get('d_est', None)
+                _bin_w      = result2.get('bin_width', None)
+                _vit_img_rgb = cv2.cvtColor(_img_for_vit, cv2.COLOR_BGR2RGB)
+                _vit_ann = _vit_img_rgb.copy()
+                for _sd in _suppressed:
+                    cv2.circle(_vit_ann, (int(round(_sd['cx'])), int(round(_sd['cy']))), 5, (0, 80, 255), -1)
+                for _kd in kept:
+                    _kcx, _kcy = int(round(_kd['cx'])), int(round(_kd['cy']))
+                    cv2.circle(_vit_ann, (_kcx, _kcy), 7, (255, 60, 60), 2)
+                    cv2.circle(_vit_ann, (_kcx, _kcy), 2, (255, 60, 60), -1)
+                _fig_vit, _axes_vit = _plt_vit.subplots(1, 2, figsize=(16, 7))
+                _axes_vit[0].imshow(_vit_img_rgb); _axes_vit[0].set_title('ViT input image', fontsize=10); _axes_vit[0].axis('off')
+                _axes_vit[1].imshow(_vit_ann)
+                _axes_vit[1].set_title(
+                    f'NMS result  kept={len(kept)}, suppressed={len(_suppressed)}\n'
+                    f'd_est={_d_est_v:.1f}px  bin_width={_bin_w:.1f}px' if _d_est_v else
+                    f'NMS result  kept={len(kept)}, suppressed={len(_suppressed)}',
+                    fontsize=9)
+                _axes_vit[1].axis('off')
+                if _bin_w:
+                    _W_vit = _img_for_vit.shape[1]
+                    for _bv in range(int(np.ceil(_W_vit / _bin_w)) + 1):
+                        _axes_vit[1].axvline(_bv * _bin_w, color='lime', lw=0.8, ls='--', alpha=0.5)
+                _plt_vit.suptitle(f'Step 2 — ViT Detection + Adaptive NMS', fontsize=12, fontweight='bold')
+                _plt_vit.tight_layout()
+                _buf_vit = _io_vit.BytesIO()
+                _plt_vit.savefig(_buf_vit, dpi=120, bbox_inches='tight', format='png')
+                _plt_vit.close()
+                _buf_vit.seek(0)
+                _vit_diag_arr = cv2.imdecode(np.frombuffer(_buf_vit.read(), np.uint8), cv2.IMREAD_COLOR)
+                _diag_steps.append({'title': f'Step 2 — ViT Detection (kept={len(kept)}, suppressed={len(_suppressed)})', 'img_bgr': _vit_diag_arr})
+            except Exception as _vit_diag_e:
+                log_fn(f"  [diag] ViT diag failed: {_vit_diag_e}")
         except Exception as e:
             import traceback
             log_fn(f"  ViT detection failed: {e}")
@@ -529,15 +650,388 @@ def run_detection(img_bgr: np.ndarray,
         d['series_label'] = legend_labels.get(d['class_name'], '')
 
     log_fn(f"[Done] {len(detections)} data points found.")
+    # Build final overlay step for diagnostics
+    try:
+        import io as _io_fin
+        import matplotlib.pyplot as _plt_fin
+        _fin_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+        _fig_fin, _ax_fin = _plt_fin.subplots(1, 1, figsize=(12, 8))
+        _ax_fin.imshow(_fin_rgb); _ax_fin.set_title(f'Final overlay  ({len(detections)} data points)', fontsize=11); _ax_fin.axis('off')
+        _plt_fin.suptitle('Step 3–4 — Filter + Coordinate Conversion + Overlay', fontsize=12, fontweight='bold')
+        _plt_fin.tight_layout()
+        _buf_fin = _io_fin.BytesIO()
+        _plt_fin.savefig(_buf_fin, dpi=120, bbox_inches='tight', format='png')
+        _plt_fin.close()
+        _buf_fin.seek(0)
+        _fin_diag_arr = cv2.imdecode(np.frombuffer(_buf_fin.read(), np.uint8), cv2.IMREAD_COLOR)
+        _diag_steps.append({'title': f'Step 3–4 — Final Overlay ({len(detections)} points)', 'img_bgr': _fin_diag_arr})
+    except Exception:
+        pass
     return {
-        'detections':  detections,
-        'overlay_img': overlay,
-        'segs':        segs,
+        'detections':    detections,
+        'overlay_img':   overlay,
+        'segs':          segs,
         'legend_labels': legend_labels,
+        'diag_steps':    _diag_steps,
+        'mode_xs':       _result2_ref.get('mode_xs', np.array([])) if (_result2_ref := locals().get('result2')) else np.array([]),
+        'prep_info':     prep_info,
+        'scaled_img_bgr': img_bgr,   # upscaled (or original if upscale=1) image
+        'upscale':        _upscale,  # scale factor applied
     }
 
 
 # ── GUI Application ───────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+class DiagnosticsWindow(tk.Toplevel):
+    """
+    Step-by-step detection diagnostics viewer.
+
+    For Stage 5 correction steps the 5-panel strip is automatically split into
+    individual sub-panels (A-E) and displayed in a scrollable grid.  A zoom
+    slider lets the user resize all thumbnails, and clicking any thumbnail
+    opens a full-resolution popup.
+    """
+
+    # Number of panels per row in Stage-5 grid view
+    GRID_COLS = 5
+    # Label suffixes for the 5 sub-panels
+    _PANEL_LABELS = ['A', 'B', 'C', 'D', 'E']
+
+    def __init__(self, parent, diag_steps: list):
+        super().__init__(parent)
+        self.title("Detection Diagnostics")
+        self.resizable(True, True)
+        self.geometry("1300x800")
+
+        self._steps = diag_steps          # list of {title, img_bgr}
+        self._idx   = 0
+        self._zoom  = tk.DoubleVar(value=1.0)  # zoom multiplier
+        self._tk_imgs: list = []          # keep refs alive
+        self._grid_panels: list = []      # split sub-panels for current step
+
+        self._build_ui()
+        self.after(100, self._refresh)
+
+    # ── helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_stage5(step: dict) -> bool:
+        """Return True when this step is a Stage 5 correction iteration."""
+        return 'Stage 5' in step.get('title', '')
+
+    @staticmethod
+    def _split_panels(img_bgr: np.ndarray, n: int = 5):
+        """Split a horizontally-stacked n-panel image into n equal slices."""
+        h, w = img_bgr.shape[:2]
+        pw = w // n
+        return [img_bgr[:, i * pw: (i + 1) * pw] for i in range(n)]
+
+    # ── UI construction ───────────────────────────────────────────────────
+
+    def _build_ui(self):
+        from PIL import Image as _PILImg, ImageTk as _PILTk  # noqa: F401
+        self._PILImg = _PILImg
+        self._PILTk  = _PILTk
+
+        # ── Toolbar ──────────────────────────────────────────────────────
+        tb = tk.Frame(self, bd=1, relief=tk.RAISED)
+        tb.pack(side=tk.TOP, fill=tk.X)
+
+        tk.Button(tb, text="◀  Prev", command=self._prev,
+                  font=("Helvetica", 11, "bold"), padx=8).pack(side=tk.LEFT, padx=4, pady=3)
+        tk.Button(tb, text="Next  ▶", command=self._next,
+                  font=("Helvetica", 11, "bold"), padx=8).pack(side=tk.LEFT, padx=4, pady=3)
+
+        self._step_label = tk.Label(tb, text="", font=("Helvetica", 11), anchor="w")
+        self._step_label.pack(side=tk.LEFT, padx=12)
+
+        # Zoom slider (right side of toolbar)
+        tk.Label(tb, text="Zoom:", font=("Helvetica", 10)).pack(side=tk.RIGHT, padx=(0, 2))
+        zoom_sl = tk.Scale(tb, from_=0.2, to=4.0, resolution=0.1,
+                           orient=tk.HORIZONTAL, length=160,
+                           variable=self._zoom, command=lambda _: self._refresh(),
+                           showvalue=True, font=("Helvetica", 9))
+        zoom_sl.pack(side=tk.RIGHT, padx=4, pady=2)
+
+        tk.Button(tb, text="💾  Save", command=self._save_img,
+                  font=("Helvetica", 10), padx=6).pack(side=tk.RIGHT, padx=8, pady=3)
+
+        # ── Step list (left sidebar) ──────────────────────────────────────
+        sidebar = tk.Frame(self, width=230, bd=1, relief=tk.SUNKEN)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=2, pady=2)
+        sidebar.pack_propagate(False)
+
+        tk.Label(sidebar, text="Steps", font=("Helvetica", 10, "bold")).pack(pady=4)
+        self._listbox = tk.Listbox(sidebar, font=("Helvetica", 9), selectmode=tk.SINGLE,
+                                   activestyle='dotbox', exportselection=False)
+        sb_scroll = tk.Scrollbar(sidebar, orient=tk.VERTICAL,
+                                 command=self._listbox.yview)
+        self._listbox.configure(yscrollcommand=sb_scroll.set)
+        sb_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._listbox.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        for step in self._steps:
+            self._listbox.insert(tk.END, step['title'])
+        self._listbox.bind('<<ListboxSelect>>', self._on_list_select)
+
+        # ── Scrollable image area ─────────────────────────────────────────
+        img_frame = tk.Frame(self, bd=2, relief=tk.SUNKEN)
+        img_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2, pady=2)
+
+        self._canvas = tk.Canvas(img_frame, bg="#1a1a1a")
+        _sb_h = tk.Scrollbar(img_frame, orient=tk.HORIZONTAL, command=self._canvas.xview)
+        _sb_v = tk.Scrollbar(img_frame, orient=tk.VERTICAL,   command=self._canvas.yview)
+        self._canvas.configure(xscrollcommand=_sb_h.set, yscrollcommand=_sb_v.set)
+        _sb_h.pack(side=tk.BOTTOM, fill=tk.X)
+        _sb_v.pack(side=tk.RIGHT,  fill=tk.Y)
+        self._canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._canvas.bind("<Configure>", lambda e: self._refresh())
+        self._canvas.bind("<MouseWheel>", self._on_wheel)
+        self._canvas.bind("<Button-4>",   lambda e: self._canvas.yview_scroll(-1, 'units'))
+        self._canvas.bind("<Button-5>",   lambda e: self._canvas.yview_scroll( 1, 'units'))
+
+    # ── Navigation ───────────────────────────────────────────────────────
+
+    def _on_list_select(self, event):
+        sel = self._listbox.curselection()
+        if sel:
+            self._idx = sel[0]
+            self._refresh()
+
+    def _prev(self):
+        if self._idx > 0:
+            self._idx -= 1
+            self._listbox.selection_clear(0, tk.END)
+            self._listbox.selection_set(self._idx)
+            self._listbox.see(self._idx)
+            self._refresh()
+
+    def _next(self):
+        if self._idx < len(self._steps) - 1:
+            self._idx += 1
+            self._listbox.selection_clear(0, tk.END)
+            self._listbox.selection_set(self._idx)
+            self._listbox.see(self._idx)
+            self._refresh()
+
+    def _on_wheel(self, event):
+        if event.delta:
+            self._canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+        else:
+            self._canvas.yview_scroll(-1 if event.num == 4 else 1, 'units')
+
+    # ── Rendering ────────────────────────────────────────────────────────
+
+    def _bgr_to_pil(self, img_bgr: np.ndarray):
+        return self._PILImg.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+
+    def _resize_pil(self, pil_img, target_w: int):
+        ow, oh = pil_img.size
+        if ow == 0:
+            return pil_img
+        nh = max(1, int(oh * target_w / ow))
+        return pil_img.resize((target_w, nh), self._PILImg.LANCZOS)
+
+    def _refresh(self):
+        if not self._steps:
+            return
+        step = self._steps[self._idx]
+        self._step_label.config(text=f"[{self._idx + 1}/{len(self._steps)}]  {step['title']}")
+        self._listbox.selection_clear(0, tk.END)
+        self._listbox.selection_set(self._idx)
+        self._listbox.see(self._idx)
+
+        self._canvas.delete('all')
+        self._tk_imgs.clear()
+
+        zoom = self._zoom.get()
+
+        if self._is_stage5(step):
+            self._render_grid(step, zoom)
+        else:
+            self._render_single(step, zoom)
+
+    def _render_single(self, step: dict, zoom: float):
+        """Render a non-Stage-5 step as a single scaled image."""
+        img_bgr = step['img_bgr']
+        cw = max(self._canvas.winfo_width(), 100)
+        ch = max(self._canvas.winfo_height(), 100)
+        ih, iw = img_bgr.shape[:2]
+        base_scale = min(cw / iw, ch / ih)
+        scale = base_scale * zoom
+        nw = max(1, int(iw * scale))
+        nh = max(1, int(ih * scale))
+        pil_img = self._bgr_to_pil(img_bgr).resize((nw, nh), self._PILImg.LANCZOS)
+        tk_img = self._PILTk.PhotoImage(pil_img)
+        self._tk_imgs.append(tk_img)
+        self._canvas.create_image(0, 0, anchor='nw', image=tk_img)
+        self._canvas.configure(scrollregion=(0, 0, nw, nh))
+
+    def _render_grid(self, step: dict, zoom: float):
+        """
+        Split the 5-panel strip and render as a grid.
+        Each thumbnail is clickable to open a full-resolution popup.
+        """
+        img_bgr = step['img_bgr']
+        panels  = self._split_panels(img_bgr, n=5)
+        self._grid_panels = panels   # keep for popup
+        title   = step['title']
+
+        COLS     = self.GRID_COLS
+        PADDING  = 8
+        LABEL_H  = 22
+
+        cw = max(self._canvas.winfo_width(), 100)
+        # Base thumbnail width: fit COLS panels + padding into canvas width
+        base_thumb_w = max(60, (cw - PADDING * (COLS + 1)) // COLS)
+        thumb_w = max(40, int(base_thumb_w * zoom))
+
+        # Compute thumbnail heights (all panels same height after resize)
+        thumb_imgs = [self._resize_pil(self._bgr_to_pil(p), thumb_w) for p in panels]
+        thumb_h    = max(ti.size[1] for ti in thumb_imgs) if thumb_imgs else 100
+
+        # Draw title row
+        self._canvas.create_text(
+            PADDING, PADDING // 2,
+            anchor='nw', text=title,
+            font=("Helvetica", 9), fill='#CCCCCC')
+
+        y_off = PADDING + 14  # below title text
+
+        for col, (panel_bgr, pil_thumb, lbl) in enumerate(
+                zip(panels, thumb_imgs, self._PANEL_LABELS)):
+            x_off = PADDING + col * (thumb_w + PADDING)
+
+            # Panel label (A-E)
+            self._canvas.create_text(
+                x_off + thumb_w // 2, y_off,
+                anchor='n', text=lbl,
+                font=("Helvetica", 10, "bold"), fill='#FFDD44')
+
+            # Thumbnail image
+            tk_img = self._PILTk.PhotoImage(pil_thumb)
+            self._tk_imgs.append(tk_img)
+            img_y = y_off + LABEL_H
+            img_id = self._canvas.create_image(
+                x_off, img_y, anchor='nw', image=tk_img)
+
+            # Highlight border on hover + click to enlarge
+            rect_id = self._canvas.create_rectangle(
+                x_off - 1, img_y - 1,
+                x_off + thumb_w, img_y + thumb_h,
+                outline='#555555', width=1)
+
+            def _on_enter(e, rid=rect_id):
+                self._canvas.itemconfig(rid, outline='#FFDD44', width=2)
+
+            def _on_leave(e, rid=rect_id):
+                self._canvas.itemconfig(rid, outline='#555555', width=1)
+
+            def _on_click(e, bgr=panel_bgr, l=lbl, t=title):
+                self._open_popup(bgr, f"{t}  [{l}]")
+
+            for item in (img_id, rect_id):
+                self._canvas.tag_bind(item, '<Enter>',  _on_enter)
+                self._canvas.tag_bind(item, '<Leave>',  _on_leave)
+                self._canvas.tag_bind(item, '<Button-1>', _on_click)
+
+        total_w = PADDING + COLS * (thumb_w + PADDING)
+        total_h = y_off + LABEL_H + thumb_h + PADDING
+        self._canvas.configure(scrollregion=(0, 0, total_w, total_h))
+
+    # ── Popup ─────────────────────────────────────────────────────────────
+
+    def _open_popup(self, img_bgr: np.ndarray, title: str):
+        """Open a resizable popup showing img_bgr at full resolution."""
+        popup = tk.Toplevel(self)
+        popup.title(title)
+        popup.resizable(True, True)
+
+        ih, iw = img_bgr.shape[:2]
+        # Limit initial size to 90% of screen
+        sw = popup.winfo_screenwidth()
+        sh = popup.winfo_screenheight()
+        max_w = int(sw * 0.90)
+        max_h = int(sh * 0.85)
+        scale = min(max_w / iw, max_h / ih, 1.0)
+        init_w = max(200, int(iw * scale))
+        init_h = max(150, int(ih * scale))
+        popup.geometry(f"{init_w}x{init_h}")
+
+        frame = tk.Frame(popup)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(frame, bg='#1a1a1a')
+        sb_h = tk.Scrollbar(frame, orient=tk.HORIZONTAL, command=canvas.xview)
+        sb_v = tk.Scrollbar(frame, orient=tk.VERTICAL,   command=canvas.yview)
+        canvas.configure(xscrollcommand=sb_h.set, yscrollcommand=sb_v.set)
+        sb_h.pack(side=tk.BOTTOM, fill=tk.X)
+        sb_v.pack(side=tk.RIGHT,  fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Zoom slider inside popup
+        ctrl = tk.Frame(popup)
+        ctrl.pack(side=tk.BOTTOM, fill=tk.X)
+        popup_zoom = tk.DoubleVar(value=scale)
+        _refs = [None]   # mutable ref for tk_img
+
+        def _draw(z=None):
+            z = popup_zoom.get()
+            nw = max(1, int(iw * z))
+            nh = max(1, int(ih * z))
+            pil = self._bgr_to_pil(img_bgr).resize((nw, nh), self._PILImg.LANCZOS)
+            tk_i = self._PILTk.PhotoImage(pil)
+            _refs[0] = tk_i
+            canvas.delete('all')
+            canvas.create_image(0, 0, anchor='nw', image=tk_i)
+            canvas.configure(scrollregion=(0, 0, nw, nh))
+
+        tk.Label(ctrl, text="Zoom:", font=("Helvetica", 9)).pack(side=tk.LEFT, padx=4)
+        tk.Scale(ctrl, from_=0.1, to=4.0, resolution=0.05,
+                 orient=tk.HORIZONTAL, length=200,
+                 variable=popup_zoom, command=_draw,
+                 showvalue=True, font=("Helvetica", 9)).pack(side=tk.LEFT)
+        tk.Button(ctrl, text="💾 Save",
+                  command=lambda: self._save_panel(img_bgr, title),
+                  font=("Helvetica", 9)).pack(side=tk.RIGHT, padx=6)
+
+        canvas.bind('<MouseWheel>',
+                    lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), 'units'))
+        canvas.bind('<Button-4>', lambda e: canvas.yview_scroll(-1, 'units'))
+        canvas.bind('<Button-5>', lambda e: canvas.yview_scroll( 1, 'units'))
+        popup.after(50, _draw)
+
+    # ── Save ─────────────────────────────────────────────────────────────
+
+    def _save_img(self):
+        if not self._steps:
+            return
+        step = self._steps[self._idx]
+        from tkinter.filedialog import asksaveasfilename
+        path = asksaveasfilename(
+            title="Save diagnostic image",
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg")],
+            initialfile=f"diag_step{self._idx + 1}.png",
+        )
+        if path:
+            cv2.imwrite(path, step['img_bgr'])
+            messagebox.showinfo("Saved", f"Saved to:\n{path}")
+
+    def _save_panel(self, img_bgr: np.ndarray, title: str):
+        from tkinter.filedialog import asksaveasfilename
+        safe = title.replace(' ', '_').replace('/', '-')[:40]
+        path = asksaveasfilename(
+            title="Save panel image",
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg")],
+            initialfile=f"{safe}.png",
+        )
+        if path:
+            cv2.imwrite(path, img_bgr)
+            messagebox.showinfo("Saved", f"Saved to:\n{path}")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1227,6 +1721,11 @@ class App(tk.Tk):
 
         self.marker_vars: dict[str, tk.BooleanVar] = {}
         self.result_detections: list = []
+        self.result_diag_steps: list = []
+        self.result_mode_xs = None
+        self.result_prep_info = None
+        self.result_scaled_img_bgr = None
+        self.result_upscale = 1.0
 
         self._build_ui()
 
@@ -1265,6 +1764,16 @@ class App(tk.Tk):
                   command=self._open_correction,
                   font=("Helvetica", 11, "bold"),
                   bg="#e67e22", fg="white", padx=8).pack(side=tk.RIGHT, padx=4, pady=3)
+
+        tk.Button(toolbar, text="🔬  Diagnostics",
+                  command=self._open_diagnostics,
+                  font=("Helvetica", 11, "bold"),
+                  bg="#6c3483", fg="white", padx=8).pack(side=tk.RIGHT, padx=4, pady=3)
+
+        tk.Button(toolbar, text="⚙️  Stage 5",
+                  command=self._run_stage5,
+                  font=("Helvetica", 11, "bold"),
+                  bg="#1a7a4a", fg="white", padx=8).pack(side=tk.RIGHT, padx=4, pady=3)
 
         # ── Main pane: canvas (left) + controls (right) ───────────────────
         main = tk.Frame(self)
@@ -1779,6 +2288,11 @@ class App(tk.Tk):
                 )
                 self.result_detections = result['detections']
                 self._overlay_img = result['overlay_img']
+                self.result_diag_steps = result.get('diag_steps', [])
+                self.result_mode_xs = result.get('mode_xs', None)
+                self.result_prep_info = result.get('prep_info', None)
+                self.result_scaled_img_bgr = result.get('scaled_img_bgr', None)
+                self.result_upscale = result.get('upscale', 1.0)
                 self.after(0, self._show_overlay)
             except Exception as e:
                 import traceback
@@ -1854,6 +2368,167 @@ class App(tk.Tk):
             img_path      = self.img_path,
             target_classes= [k for k, v in self.marker_vars.items() if v.get()],
         )
+
+    # ── Diagnostics ───────────────────────────────────────────────────────
+    def _open_diagnostics(self):
+        """Open the DiagnosticsWindow with step-by-step detection images."""
+        if not self.result_diag_steps:
+            messagebox.showinfo("No diagnostics",
+                                "Run detection first. Diagnostics are collected during detection.")
+            return
+        DiagnosticsWindow(self, self.result_diag_steps)
+
+    # ── Stage 5 (SSIM greedy correction) ────────────────────────────────
+    def _run_stage5(self):
+        """Run 5_correction_v2.py on the current image and append iteration
+        results to the diagnostics steps list."""
+        if self.img_bgr is None or not self.img_path:
+            messagebox.showinfo("No image", "Load an image first.")
+            return
+        if not self.result_detections:
+            messagebox.showinfo("No detections",
+                                "Run detection first (▶ Run Detection).")
+            return
+
+        corr_py = SRC_DIR / "5_correction_v2.py"
+        if not corr_py.exists():
+            messagebox.showerror("Missing file",
+                                 f"5_correction_v2.py not found at:\n{corr_py}")
+            return
+
+        known_classes = [k for k, v in self.marker_vars.items() if v.get()]
+        if not known_classes:
+            known_classes = list({d['class_name'] for d in self.result_detections})
+
+        self._log("=" * 50)
+        self._log("Running Stage 5 (SSIM greedy correction) …")
+        self._log(f"  known_classes: {known_classes}")
+        mode_xs          = self.result_mode_xs
+        prep_info        = self.result_prep_info
+        scaled_img_bgr   = self.result_scaled_img_bgr
+        result_upscale   = self.result_upscale
+        if mode_xs is not None:
+            self._log(f"  mode_xs: {len(mode_xs)} grid columns")
+        if result_upscale != 1.0:
+            self._log(f"  upscale={result_upscale}x → using scaled image for Stage 5")
+
+        def _worker():
+            import tempfile, os as _os
+            _tmp_path = None
+            try:
+                mod5 = _load('correction_v2', corr_py)
+
+                # If an upscaled image exists, save it to a temp file so that
+                # Stage 5 reads the same pixel coordinates as prep_info uses.
+                # Without this, img_path (original) and prep_info (upscaled coords)
+                # are mismatched, causing legend_box / plot_area to be wrong.
+                if scaled_img_bgr is not None and result_upscale != 1.0:
+                    _suffix = _os.path.splitext(self.img_path)[1] or '.png'
+                    _tmp = tempfile.NamedTemporaryFile(
+                        suffix=_suffix, delete=False, dir=_os.path.dirname(self.img_path))
+                    _tmp_path = _tmp.name
+                    _tmp.close()
+                    cv2.imwrite(_tmp_path, scaled_img_bgr)
+                    _stage5_img_path = _tmp_path
+                    self._log(f"  Temp scaled image: {_tmp_path}")
+                else:
+                    _stage5_img_path = self.img_path
+
+                result5 = mod5.run_correction(
+                    img_path         = _stage5_img_path,
+                    model_path       = str(MODEL_PATH),
+                    detector_py_path = str(SRC_DIR / '1_point_detection_v3.py'),
+                    known_classes    = known_classes,
+                    mode_xs          = mode_xs,
+                    prep_info        = prep_info,
+                    return_diag_imgs = True,
+                )
+                diag_imgs  = result5.get('diag_imgs', [])
+                history    = result5.get('history', [])
+                p_current  = result5.get('P_current', [])
+                s_current  = result5.get('S_current', [])
+                self.after(0, lambda: self._on_stage5_done(
+                    diag_imgs, history, p_current, s_current))
+            except Exception as e:
+                import traceback
+                _tb = traceback.format_exc()
+                _e  = e
+                self.after(0, lambda _e=_e, _tb=_tb: self._log(
+                    f"Stage 5 ERROR: {_e}\n{_tb}"))
+            finally:
+                # Clean up temp file
+                if _tmp_path and _os.path.exists(_tmp_path):
+                    try:
+                        _os.remove(_tmp_path)
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_stage5_done(self, diag_imgs: list, history: list,
+                        p_current: list, s_current: list):
+        """Called on main thread when Stage 5 finishes."""
+        n_iter = len(diag_imgs)
+        self._log(f"Stage 5 complete — {n_iter} iterations.")
+        for row in history:
+            t, act, npts, dist, imp = row
+            self._log(f"  iter={t:>2}  {act:<10}  pts={npts:>3}  "
+                      f"1-SSIM={dist:.5f}  {'✓ improved' if imp else '—'}")
+
+        # ── Update result_detections with Stage 5 corrected points ──────────
+        # p_current uses 'cx'/'cy' keys (plot-area pixel coords).
+        # result_detections uses 'cx_px'/'cy_px' + 'x_data'/'y_data'.
+        # Convert here so CorrectionWindow sees the updated points.
+        if p_current:
+            try:
+                x_min = float(self.x_min_e.get())
+                x_max = float(self.x_max_e.get())
+                y_min = float(self.y_min_e.get())
+                y_max = float(self.y_max_e.get())
+            except ValueError:
+                x_min, x_max, y_min, y_max = 0, 1, 0, 1
+            x_log = self.x_scale_var.get() == "log10"
+            y_log = self.y_scale_var.get() == "log10"
+            plot_area = getattr(self, '_plot_rect_img', None)
+            # Stage 5 ran on the upscaled image, so cx/cy are in upscaled coords.
+            # Divide by upscale to convert back to original-image pixel coords
+            # before calling px_to_data (which uses _plot_rect_img = original coords).
+            _inv_scale = 1.0 / self.result_upscale if self.result_upscale else 1.0
+
+            new_detections = []
+            for p in p_current:
+                if p.get('class_name') == 'suppressed':
+                    continue
+                cx_scaled = float(p.get('cx', p.get('cx_px', 0)))
+                cy_scaled = float(p.get('cy', p.get('cy_px', 0)))
+                # Convert to original-image pixel coords
+                cx = cx_scaled * _inv_scale
+                cy = cy_scaled * _inv_scale
+                if plot_area is not None:
+                    xd, yd = px_to_data(cx, cy, plot_area,
+                                        (x_min, x_max), (y_min, y_max),
+                                        x_log, y_log)
+                else:
+                    xd, yd = cx, cy
+                new_detections.append({
+                    'class_name': p.get('class_name', 'filled_circle'),
+                    'cx_px':      cx,
+                    'cy_px':      cy,
+                    'x_data':     xd,
+                    'y_data':     yd,
+                    'confidence': p.get('confidence', 1.0),
+                })
+            new_detections.sort(key=lambda d: d['x_data'])
+            self.result_detections = new_detections
+            self._log(f"  Stage 5: result_detections updated → {len(new_detections)} active pts"
+                      f"  (inv_scale={_inv_scale:.4f})")
+
+        # Append Stage 5 steps to existing diagnostics
+        self.result_diag_steps.extend(diag_imgs)
+        if diag_imgs:
+            DiagnosticsWindow(self, self.result_diag_steps)
+        else:
+            messagebox.showinfo("Stage 5", "Stage 5 converged with no iterations.")
 
     # ── Save results ──────────────────────────────────────────────────────
     def _save_results(self):

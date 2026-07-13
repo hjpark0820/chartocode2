@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plot Digitizer</title>
+<style>
+  :root { --accent:#3B6D11; --border:#ccc; --muted:#666; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+         margin: 0; padding: 24px; color:#222; background:#fafafa; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 20px; font-size: 14px; }
+  .row { display: flex; gap: 24px; align-items: flex-start; flex-wrap: wrap; }
+  .panel { background:#fff; border:1px solid var(--border); border-radius:10px;
+           padding:16px; }
+  .controls { width: 300px; }
+  label.file { display:inline-block; padding:8px 14px; background:var(--accent);
+               color:#fff; border-radius:8px; cursor:pointer; font-size:14px; }
+  label.file input { display:none; }
+  .tool { display:flex; align-items:center; gap:8px; margin:12px 0; font-size:14px; }
+  .tool button { padding:6px 12px; border:1px solid var(--border); background:#fff;
+                 border-radius:8px; cursor:pointer; font-size:13px; }
+  .tool button.active { border-color:var(--accent); color:var(--accent); font-weight:600; }
+  .swatch { width:14px; height:14px; border-radius:3px; display:inline-block; }
+  .box-info { font-size:12px; color:var(--muted); margin-top:2px; font-family:monospace; }
+  #run { width:100%; padding:12px; background:var(--accent); color:#fff; border:none;
+         border-radius:8px; font-size:15px; cursor:pointer; margin-top:8px; }
+  #run:disabled { opacity:.5; cursor:default; }
+  canvas { border:1px solid var(--border); border-radius:8px; cursor:crosshair;
+           max-width:100%; touch-action:none; }
+  .canvaswrap { max-width: 640px; }
+  #result img { max-width:100%; border:1px solid var(--border); border-radius:8px; }
+  #result a { display:inline-block; margin-top:12px; padding:10px 16px;
+              background:#185FA5; color:#fff; border-radius:8px; text-decoration:none;
+              font-size:14px; }
+  .hint { font-size:12px; color:var(--muted); line-height:1.6; }
+  pre.log { font-size:11px; color:#555; background:#f4f4f4; padding:8px;
+            border-radius:6px; max-height:140px; overflow:auto; white-space:pre-wrap; }
+  .spinner { display:none; font-size:14px; color:var(--accent); }
+  .modeseg { display:inline-flex; background:var(--surface-0,#f1efe8); border:1px solid var(--border); border-radius:10px; padding:3px; gap:3px; margin-top:6px; }
+  .modebtn { display:flex; align-items:center; gap:7px; padding:8px 16px; border:2px solid transparent; background:transparent; color:var(--muted,#6b6b6b); border-radius:8px; cursor:pointer; font-size:13px; font-weight:500; transition:all .15s; }
+  .modebtn svg { display:block; }
+  .modebtn:hover { color:#333; }
+  .modebtn-on { background:#fff; color:var(--accent); border-color:var(--accent); font-weight:600; box-shadow:0 1px 4px rgba(24,95,165,.2); }
+  .modebtn-on::after { content:"\2713"; font-size:12px; font-weight:700; margin-left:2px; }
+  .toolrow { display:flex; gap:6px; margin:8px 0 4px; }
+  .toolbtn { flex:1; display:flex; align-items:center; justify-content:center; gap:6px; padding:8px 6px; border:1px solid var(--border); background:#fff; color:#333; border-radius:8px; cursor:pointer; font-size:12px; font-weight:500; white-space:nowrap; transition:all .12s; }
+  .toolbtn:hover { border-color:var(--accent); }
+  .toolbtn.active { border-color:var(--accent); background:rgba(24,95,165,.08); color:var(--accent); font-weight:600; }
+  .toolbtn-clear { flex:0 0 auto; color:var(--muted,#6b6b6b); }
+  .toolbtn .swatch { width:11px; height:11px; border-radius:3px; }
+  .markergrid { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+  .markeropt { display:flex; align-items:center; gap:8px; padding:7px 9px; border:1px solid var(--border); border-radius:8px; cursor:pointer; font-size:12px; user-select:none; transition:all .12s; background:#fff; }
+  .markeropt:hover { border-color:var(--accent); }
+  .markeropt input { margin:0; }
+  .markeropt.sel { border-color:var(--accent); background:rgba(24,95,165,.06); }
+  .markeropt svg { flex:none; }
+  .axisgrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:8px; }
+  .axisgrid label { font-size:12px; color:var(--muted); display:flex;
+                    flex-direction:column; gap:3px; }
+  .axisgrid input { padding:6px 8px; border:1px solid var(--border);
+                    border-radius:6px; font-size:13px; }
+  .axischecks { display:flex; gap:16px; font-size:13px; margin-bottom:4px; }
+  .axischecks label { display:flex; align-items:center; gap:5px; cursor:pointer; }
+  /* colour-mask gallery */
+  .masks-title { font-size:14px; font-weight:600; margin:16px 0 8px; }
+  .masks { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px,1fr));
+           gap:10px; }
+  .maskcard { border:1px solid var(--border); border-radius:8px; padding:6px;
+              background:#fff; }
+  .maskcard img { width:100%; border:none; border-radius:4px; display:block; }
+  .maskcard .cap { font-size:11px; color:#444; margin-top:4px; font-family:monospace;
+                   line-height:1.35; }
+  .pipe { font-size:12px; color:var(--muted); font-family:monospace; margin-bottom:8px; }
+</style>
+</head>
+<body>
+  <h1>Plot Digitizer</h1>
+  <p class="sub">Upload a PNG. Optionally drag to mark the legend and plot area; if you skip them, they are detected automatically.</p>
+
+  <div class="row">
+    <!-- Left: controls -->
+    <div class="panel controls">
+      <label class="file">Choose PNG
+        <input id="fileInput" type="file" accept="image/png,image/jpeg">
+      </label>
+
+      <div class="tool" style="margin-top:10px;">
+        <span style="font-size:13px; font-weight:600;">Mode:</span>
+        <div class="modeseg">
+          <button id="modeColor" data-mode="color" class="modebtn modebtn-on">
+            <svg width="16" height="16" viewBox="0 0 16 16"><circle cx="5" cy="6" r="2.6" fill="#e24b4a"/><circle cx="10.5" cy="9.5" r="2.6" fill="#1d9e75"/><circle cx="8" cy="5" r="2.6" fill="#378add" opacity="0.9"/></svg>
+            Colour
+          </button>
+          <button id="modeBw" data-mode="bw" class="modebtn">
+            <svg width="16" height="16" viewBox="0 0 16 16"><circle cx="5" cy="8" r="2.4" fill="#2c2c2a"/><rect x="8.4" y="5.6" width="4.6" height="4.6" fill="none" stroke="#2c2c2a" stroke-width="1.3"/></svg>
+            B&amp;W
+          </button>
+        </div>
+      </div>
+
+      <div class="toolrow">
+        <button id="btnLegend" data-tool="legend" class="toolbtn"><span class="swatch" style="background:#d64545"></span>Legend</button>
+        <button id="btnPlot" data-tool="plot" class="toolbtn"><span class="swatch" style="background:#1d9e75"></span>Plot area</button>
+        <button id="btnClear" class="toolbtn toolbtn-clear">Clear</button>
+      </div>
+
+      <hr style="border:none; border-top:1px solid var(--border); margin:16px 0;">
+      <div style="font-size:13px; font-weight:600; margin-bottom:8px;">Axis values <span id="axisReq" style="display:none; color:var(--accent);">(required for B&amp;W)</span><span id="axisOpt">(optional)</span></div>
+      <p class="hint" style="margin-top:0;">Values map to the plot-area edges. <span id="axisOcrHint">Leave blank to read the numbers automatically (OCR).</span></p>
+      <div class="axisgrid">
+        <label>x min <input id="xMin" type="text" inputmode="text" placeholder="auto"></label>
+        <label>x max <input id="xMax" type="text" inputmode="text" placeholder="auto"></label>
+        <label>y min <input id="yMin" type="text" inputmode="text" placeholder="e.g. 1e-15 or 10^-15"></label>
+        <label>y max <input id="yMax" type="text" inputmode="text" placeholder="auto"></label>
+      </div>
+      <div class="axischecks">
+        <label><input id="xLog" type="checkbox"> x log scale</label>
+        <label><input id="yLog" type="checkbox"> y log scale</label>
+      </div>
+
+      <div id="bwPanel" style="display:none; margin-top:14px; padding-top:12px; border-top:1px dashed var(--border);">
+        <div style="font-size:13px; font-weight:600; margin-bottom:8px;">B&amp;W options</div>
+        <div style="font-size:13px; margin-bottom:6px;">Marker shapes to detect</div>
+        <div id="bwClasses" class="markergrid"></div>
+        <p class="hint" style="margin-top:8px;">Tick the marker shapes present in your plot. None ticked = try all 12 shapes.</p>
+        <label style="display:block; margin-top:10px;">Confidence <input id="bwConf" type="text" inputmode="decimal" placeholder="auto (0-1)" style="width:90px;"></label>
+        <div style="margin-top:10px;">
+          <span style="font-size:13px;">Scale:</span>
+          <label style="margin-left:6px;"><input type="radio" name="bwScaleMode" value="auto" checked> Auto (from legend)</label>
+          <label style="margin-left:8px;"><input type="radio" name="bwScaleMode" value="manual"> Manual</label>
+          <input id="bwScaleVal" type="text" inputmode="decimal" value="1.0" disabled style="width:70px; margin-left:6px;">
+        </div>
+        <label style="display:block; margin-top:8px;"><input id="bwErrbars" type="checkbox"> plot has error bars</label>
+      </div>
+
+      <button id="run" disabled>Run</button>
+      <div class="spinner" id="spinner">Processing... (this can take up to a minute)</div>
+    </div>
+
+    <!-- Middle: canvas -->
+    <div class="panel canvaswrap">
+      <canvas id="canvas" width="600" height="400"></canvas>
+    </div>
+
+    <!-- Right: result -->
+    <div class="panel" id="result" style="min-width:320px; display:none;">
+      <div id="summary" style="font-size:14px; margin-bottom:10px;"></div>
+      <img id="resultImg" alt="data point overlay">
+      <div id="compareBox" style="display:none;">
+        <div style="display:flex; gap:12px; flex-wrap:wrap;">
+          <div style="flex:1; min-width:220px;">
+            <div style="font-size:12px; font-weight:600; color:var(--muted,#6b6b6b); margin-bottom:4px;">Before — Step 4 (detection)</div>
+            <img id="compareImg4" alt="step 4 result" style="width:100%; border:1px solid var(--border); border-radius:8px;">
+          </div>
+          <div style="flex:1; min-width:220px;">
+            <div style="font-size:12px; font-weight:600; color:var(--accent); margin-bottom:4px;">After — Step 5 (correction)</div>
+            <img id="compareImg5" alt="step 5 result" style="width:100%; border:1px solid var(--accent); border-radius:8px;">
+          </div>
+        </div>
+      </div>
+      <br>
+      <a id="downloadXlsx" href="#">Download data file (.xlsx)</a>
+      <button id="openEditor" style="display:none; margin-top:12px; margin-left:8px; padding:10px 16px; background:var(--accent); color:#fff; border:none; border-radius:8px; cursor:pointer; font-size:14px;">Correct data points →</button>
+      <button id="toggleDiag" style="display:none; margin-top:12px; margin-left:8px; padding:10px 16px; background:#fff; color:#333; border:1px solid var(--border); border-radius:8px; cursor:pointer; font-size:14px;">Show legend fit diagnostic</button>
+      <button id="btnStep5" style="display:none; margin-top:12px; margin-left:8px; padding:10px 16px; background:#fff; color:var(--accent); border:1px solid var(--accent); border-radius:8px; cursor:pointer; font-size:14px;">Run Step 5 correction ↻</button>
+      <div id="diagBox" style="display:none; margin-top:12px;">
+        <div class="hint">Legend detection diagnostic — is the table fitted correctly? green = accepted colour swatch · cyan = accepted grey/black key · orange = rejected (near-neutral) · yellow = rejected (no text label beside it) · red = rejected (size/shape).</div>
+        <img id="diagImg" alt="legend diagnostic" style="max-width:100%; border:1px solid var(--border); border-radius:8px;">
+        <div class="hint" id="legendOverlayWrap" style="margin-top:8px;">Legend table mapped on the plot:</div>
+        <img id="legendImg" alt="legend table overlay" style="max-width:100%; border:1px solid var(--border); border-radius:8px;">
+      </div>
+    </div>
+  </div>
+
+  <!-- Human-assist correction editor (full width, appears after a run) -->
+  <div class="panel" id="editor" style="display:none; margin-top:24px;">
+    <h1 style="font-size:17px;">Correct data points</h1>
+    <p class="hint" style="margin-top:0;">
+      Pick a curve colour, then: <b>drag</b> a dot to move it · <b>click empty space</b> to add a point to the selected curve · <b>click a dot</b> then Delete (or the Remove button) to remove it. Then press <b>Recompute</b>.
+    </p>
+    <div class="tool" id="curvePicker" style="flex-wrap:wrap;"></div>
+    <div class="tool">
+      <button id="edDelete">Remove selected</button>
+      <button id="edReset">Reset to detected</button>
+      <button id="edRecompute" style="background:var(--accent); color:#fff; border:none;">Recompute &amp; reconstruct</button>
+      <span style="margin-left:12px;">Zoom:</span>
+      <button id="edZoomOut" title="Zoom out">&#8722;</button>
+      <span id="edZoomLabel" class="hint" style="min-width:42px; display:inline-block; text-align:center;">100%</span>
+      <button id="edZoomIn" title="Zoom in">&#43;</button>
+      <button id="edZoomFit" title="Fit">Fit</button>
+      <span class="hint" id="edStatus"></span>
+    </div>
+    <p class="hint" style="margin-top:0;">Tip: use +/&#8722; or Ctrl+scroll over the image to zoom; the reconstructed plot updates live as you edit.</p>
+    <div class="row">
+      <div class="canvaswrap">
+        <div class="hint">Original + editable points</div>
+        <div id="editScroll" style="max-height:520px; max-width:100%; overflow:auto; border:1px solid var(--border); border-radius:8px;">
+          <canvas id="editCanvas" width="600" height="400" style="display:block;"></canvas>
+        </div>
+      </div>
+      <div class="canvaswrap">
+        <div class="hint">Reconstructed plot (live)</div>
+        <canvas id="reconCanvas" width="600" height="400" style="background:#fff; max-width:100%; height:auto; border:1px solid var(--border); border-radius:8px;"></canvas>
+      </div>
+    </div>
+    <div style="margin-top:12px;">
+      <button id="edCsv" style="background:#185FA5; color:#fff; border:none; padding:10px 16px; border-radius:8px; cursor:pointer;">Download corrected data (.csv)</button>
+    </div>
+    <div id="edTableWrap" style="max-height:280px; overflow:auto; margin-top:12px;"></div>
+  </div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let img = new Image();
+let imgLoaded = false;
+let scale = 1;
+let tool = null;
+let boxes = { legend: null, plot: null };
+let drag = null;
+let fileBlob = null;
+let APP_MODE = 'color';                // 'color' | 'bw'
+
+function setMode(m) {
+  APP_MODE = m;
+  document.getElementById('modeColor').classList.toggle('modebtn-on', m === 'color');
+  document.getElementById('modeBw').classList.toggle('modebtn-on', m === 'bw');
+  const bw = (m === 'bw');
+  document.getElementById('bwPanel').style.display = bw ? 'block' : 'none';
+  // legend region: colour uses it for the palette, B&W to exclude it from detection.
+  // Keep the button compact; the meaning is conveyed by the mode hint below.
+  // axis values are OPTIONAL for colour (OCR fallback) but REQUIRED for B&W
+  document.getElementById('axisReq').style.display = bw ? 'inline' : 'none';
+  document.getElementById('axisOpt').style.display = bw ? 'none' : 'inline';
+  document.getElementById('axisOcrHint').style.display = bw ? 'none' : 'inline';
+}
+document.getElementById('modeColor').addEventListener('click', () => setMode('color'));
+document.getElementById('modeBw').addEventListener('click', () => setMode('bw'));
+
+// Build the marker-shape checkbox grid with little SVG shape icons.
+const MARKER_SHAPES = [
+  ['filled_circle', 'Circle', true, 'circle'],
+  ['open_circle', 'Circle', false, 'circle'],
+  ['filled_square', 'Square', true, 'square'],
+  ['open_square', 'Square', false, 'square'],
+  ['filled_triangle', 'Triangle', true, 'triangle'],
+  ['open_triangle', 'Triangle', false, 'triangle'],
+  ['filled_inv_triangle', 'Inv triangle', true, 'invtriangle'],
+  ['open_inv_triangle', 'Inv triangle', false, 'invtriangle'],
+  ['filled_rhombus', 'Diamond', true, 'diamond'],
+  ['open_rhombus', 'Diamond', false, 'diamond'],
+  ['x_marker', 'X mark', true, 'x'],
+  ['plus_marker', 'Plus', true, 'plus'],
+];
+function shapeSvg(kind, filled) {
+  const f = filled ? 'var(--accent)' : 'none';
+  const s = 'var(--accent)';
+  let inner;
+  if (kind === 'circle') inner = `<circle cx="9" cy="9" r="6" fill="${f}" stroke="${s}" stroke-width="1.6"/>`;
+  else if (kind === 'square') inner = `<rect x="3.5" y="3.5" width="11" height="11" fill="${f}" stroke="${s}" stroke-width="1.6"/>`;
+  else if (kind === 'triangle') inner = `<path d="M9 2.5L15.5 15H2.5Z" fill="${f}" stroke="${s}" stroke-width="1.6" stroke-linejoin="round"/>`;
+  else if (kind === 'invtriangle') inner = `<path d="M2.5 3H15.5L9 15.5Z" fill="${f}" stroke="${s}" stroke-width="1.6" stroke-linejoin="round"/>`;
+  else if (kind === 'diamond') inner = `<path d="M9 2.5L15.5 9L9 15.5L2.5 9Z" fill="${f}" stroke="${s}" stroke-width="1.6" stroke-linejoin="round"/>`;
+  else if (kind === 'x') inner = `<path d="M4 4L14 14M14 4L4 14" fill="none" stroke="${s}" stroke-width="2" stroke-linecap="round"/>`;
+  else inner = `<path d="M9 3V15M3 9H15" fill="none" stroke="${s}" stroke-width="2" stroke-linecap="round"/>`;
+  return `<svg width="18" height="18" viewBox="0 0 18 18">${inner}</svg>`;
+}
+function buildMarkerGrid() {
+  const g = document.getElementById('bwClasses');
+  g.innerHTML = '';
+  MARKER_SHAPES.forEach(([val, name, filled, kind]) => {
+    const lab = document.createElement('label');
+    lab.className = 'markeropt';
+    lab.innerHTML = `<input type="checkbox" value="${val}">${shapeSvg(kind, filled)}<span>${filled ? 'Filled' : 'Open'} ${name.toLowerCase()}</span>`;
+    const cb = lab.querySelector('input');
+    cb.addEventListener('change', () => lab.classList.toggle('sel', cb.checked));
+    g.appendChild(lab);
+  });
+}
+buildMarkerGrid();
+function selectedMarkers() {
+  return Array.from(document.querySelectorAll('#bwClasses input:checked')).map(c => c.value);
+}
+// Enable the manual scale field only in Manual mode (Auto = detect from legend).
+document.querySelectorAll('input[name="bwScaleMode"]').forEach(r => {
+  r.addEventListener('change', () => {
+    document.getElementById('bwScaleVal').disabled =
+      (document.querySelector('input[name="bwScaleMode"]:checked').value !== 'manual');
+  });
+});
+
+const COLORS = { legend: '#d64545', plot: '#1d9e75' };
+
+document.getElementById('fileInput').addEventListener('change', e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  fileBlob = f;
+  const url = URL.createObjectURL(f);
+  img = new Image();
+  img.onload = () => {
+    imgLoaded = true;
+    const maxW = 600;
+    scale = Math.min(1, maxW / img.width);
+    canvas.width = Math.round(img.width * scale);
+    canvas.height = Math.round(img.height * scale);
+    boxes = { legend: null, plot: null };
+    updateInfo();
+    redraw();
+    document.getElementById('run').disabled = false;
+  };
+  img.src = url;
+});
+
+for (const b of [document.getElementById('btnLegend'), document.getElementById('btnPlot')]) {
+  b.addEventListener('click', () => {
+    tool = (tool === b.dataset.tool) ? null : b.dataset.tool;
+    document.getElementById('btnLegend').classList.toggle('active', tool === 'legend');
+    document.getElementById('btnPlot').classList.toggle('active', tool === 'plot');
+  });
+}
+document.getElementById('btnClear').addEventListener('click', () => {
+  boxes = { legend: null, plot: null };
+  tool = null;
+  document.getElementById('btnLegend').classList.remove('active');
+  document.getElementById('btnPlot').classList.remove('active');
+  for (const id of ['xMin','xMax','yMin','yMax']) document.getElementById(id).value = '';
+  document.getElementById('xLog').checked = false;
+  document.getElementById('yLog').checked = false;
+  updateInfo(); redraw();
+});
+
+function canvasPos(e) {
+  const r = canvas.getBoundingClientRect();
+  const cx = (e.clientX - r.left) * (canvas.width / r.width);
+  const cy = (e.clientY - r.top) * (canvas.height / r.height);
+  return { x: Math.max(0, Math.min(canvas.width, cx)),
+           y: Math.max(0, Math.min(canvas.height, cy)) };
+}
+canvas.addEventListener('pointerdown', e => {
+  if (!imgLoaded || !tool) return;
+  const p = canvasPos(e);
+  drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const p = canvasPos(e);
+  drag.x1 = p.x; drag.y1 = p.y;
+  redraw();
+});
+canvas.addEventListener('pointerup', e => {
+  if (!drag || !tool) { drag = null; return; }
+  const x0 = Math.min(drag.x0, drag.x1) / scale;
+  const y0 = Math.min(drag.y0, drag.y1) / scale;
+  const x1 = Math.max(drag.x0, drag.x1) / scale;
+  const y1 = Math.max(drag.y0, drag.y1) / scale;
+  if (Math.abs(x1 - x0) > 4 && Math.abs(y1 - y0) > 4) {
+    boxes[tool] = [Math.round(x0), Math.round(y0), Math.round(x1), Math.round(y1)];
+  }
+  drag = null;
+  updateInfo(); redraw();
+});
+
+function updateInfo() {
+  // legend/plot-area coordinate readouts were removed from the UI; nothing to do.
+}
+
+function redraw() {
+  if (!imgLoaded) return;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  for (const key of ['legend', 'plot']) {
+    const b = boxes[key];
+    if (!b) continue;
+    ctx.strokeStyle = COLORS[key];
+    ctx.lineWidth = 2;
+    ctx.strokeRect(b[0]*scale, b[1]*scale, (b[2]-b[0])*scale, (b[3]-b[1])*scale);
+    ctx.fillStyle = COLORS[key];
+    ctx.font = '12px sans-serif';
+    ctx.fillText(key, b[0]*scale + 3, b[1]*scale + 13);
+  }
+  if (drag && tool) {
+    ctx.strokeStyle = COLORS[tool];
+    ctx.setLineDash([5, 4]);
+    ctx.lineWidth = 2;
+    ctx.strokeRect(Math.min(drag.x0,drag.x1), Math.min(drag.y0,drag.y1),
+                   Math.abs(drag.x1-drag.x0), Math.abs(drag.y1-drag.y0));
+    ctx.setLineDash([]);
+  }
+}
+
+// Normalise axis values so scientific / power-of-ten notation is accepted and
+// sent as a plain float string the server can parse (Python float()):
+//   "10^(-15)", "10^-15", "10**-15", "10E-15" -> "1e-15"
+//   "2x10^3", "2*10^3", "2×10^-5"             -> "2e3", "2e-5"
+//   "1e-15", "3.2E4", "0.001", "-5"           -> unchanged (already valid)
+function parseAxisValue(s) {
+  s = (s || '').trim();
+  if (!s) return '';
+  const clean = s.replace(/\s+/g, '');
+  // Only transform explicit power-of-ten forms (a × 10 ^ b). The ^ / ** is
+  // REQUIRED, so plain numbers like "100" and already-valid scientific forms
+  // like "1e-15" or "3.2E4" pass through untouched (Python float() reads them).
+  //   "10^(-15)", "10^-15", "10**-15"  -> "1e-15"
+  //   "2x10^3", "2*10^-5", "2×10^-5"   -> "2e3", "2e-5"
+  const m = clean.match(/^([+-]?\d*\.?\d+)?[x*×·]?10(?:\^|\*\*)\(?([+-]?\d+)\)?$/);
+  if (m) {
+    const a = (m[1] === undefined || m[1] === '') ? '1' : m[1];
+    return a + 'e' + m[2];
+  }
+  return s;   // "100", "1e-15", "3.2E4", "0.001", "-5" -> unchanged
+}
+
+async function runDigitize(withCorrect) {
+  if (!fileBlob) return;
+  document.getElementById('run').disabled = true;
+  const step5Btn = document.getElementById('btnStep5');
+  if (step5Btn) step5Btn.disabled = true;
+  document.getElementById('spinner').textContent = withCorrect
+    ? 'Running Step 5 correction... (this is slower)'
+    : 'Processing... (this can take up to a minute)';
+  document.getElementById('spinner').style.display = 'block';
+  const fd = new FormData();
+  fd.append('image', fileBlob);
+  fd.append('mode', APP_MODE);
+  if (boxes.legend) fd.append(APP_MODE === 'bw' ? 'legend_area' : 'legend_box', boxes.legend.join(','));
+  if (boxes.plot)   fd.append('plot_area',  boxes.plot.join(','));
+  const xMin = parseAxisValue(document.getElementById('xMin').value);
+  const xMax = parseAxisValue(document.getElementById('xMax').value);
+  const yMin = parseAxisValue(document.getElementById('yMin').value);
+  const yMax = parseAxisValue(document.getElementById('yMax').value);
+  if (xMin) fd.append('x_min', xMin);
+  if (xMax) fd.append('x_max', xMax);
+  if (yMin) fd.append('y_min', yMin);
+  if (yMax) fd.append('y_max', yMax);
+  if (document.getElementById('xLog').checked) fd.append('x_log', '1');
+  if (document.getElementById('yLog').checked) fd.append('y_log', '1');
+  if (APP_MODE === 'bw') {
+    const cls = selectedMarkers();
+    if (cls.length) fd.append('known_classes', cls.join(','));
+    const cf = document.getElementById('bwConf').value.trim();
+    if (cf) fd.append('conf', cf);
+    // Scale: Manual sends the value; Auto omits it so the server auto-detects from legend.
+    const scaleMode = document.querySelector('input[name="bwScaleMode"]:checked').value;
+    if (scaleMode === 'manual') {
+      const sv = document.getElementById('bwScaleVal').value.trim();
+      if (sv) fd.append('scale', sv);
+    }
+    fd.append('has_errorbars', document.getElementById('bwErrbars').checked ? '1' : '0');
+    if (withCorrect) fd.append('correct', '1');   // Step 5 runs only on explicit request
+  }
+  try {
+    const res = await fetch('/digitize', { method: 'POST', body: fd });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    window.lastData = data;
+    document.getElementById('result').style.display = 'block';
+    document.getElementById('summary').textContent = data.summary || '';
+    const overlayUrl = data.overlay_url + '?t=' + Date.now();
+    const resultImg = document.getElementById('resultImg');
+    const compareBox = document.getElementById('compareBox');
+    if (withCorrect && window._step4Overlay) {
+      // Step 5: show Step-4 (before) beside the corrected Step-5 (after).
+      resultImg.style.display = 'none';
+      compareBox.style.display = 'block';
+      document.getElementById('compareImg4').src = window._step4Overlay;
+      document.getElementById('compareImg5').src = overlayUrl;
+    } else {
+      // Step 4 (detection): single image; remember it for a later comparison.
+      resultImg.style.display = 'block';
+      resultImg.src = overlayUrl;
+      compareBox.style.display = 'none';
+      window._step4Overlay = overlayUrl;
+    }
+    document.getElementById('downloadXlsx').href = data.xlsx_url;
+    // Legend-fit diagnostic: available via a toggle button (open/close).
+    const toggleDiag = document.getElementById('toggleDiag');
+    const diagBox = document.getElementById('diagBox');
+    const diagImg = document.getElementById('diagImg');
+    const legImg = document.getElementById('legendImg');
+    const legWrap = document.getElementById('legendOverlayWrap');
+    if (data.legend_diagnostic_url || data.legend_overlay_url || data.job_id) {
+      toggleDiag.style.display = 'inline-block';
+      diagBox.style.display = 'none';
+      toggleDiag.textContent = 'Show legend fit diagnostic';
+      let diagLoaded = false;
+      toggleDiag.onclick = () => {
+        const open = diagBox.style.display === 'none';
+        diagBox.style.display = open ? 'block' : 'none';
+        toggleDiag.textContent = open ? 'Hide legend fit diagnostic'
+                                      : 'Show legend fit diagnostic';
+        if (open && !diagLoaded) {
+          const dUrl = data.legend_diagnostic_url ||
+            (data.job_id ? '/result/' + data.job_id + '/legend_diagnostic.png' : null);
+          const oUrl = data.legend_overlay_url ||
+            (data.job_id ? '/result/' + data.job_id + '/legend_overlay.png' : null);
+          if (dUrl) { diagImg.src = dUrl + '?t=' + Date.now(); diagImg.style.display = 'block'; }
+          else diagImg.style.display = 'none';
+          if (oUrl) { legImg.src = oUrl + '?t=' + Date.now(); legImg.style.display = 'block'; legWrap.style.display = 'block'; }
+          else { legImg.style.display = 'none'; legWrap.style.display = 'none'; }
+          diagLoaded = true;
+        }
+      };
+    } else {
+      toggleDiag.style.display = 'none';
+      diagBox.style.display = 'none';
+    }
+    // "Correct data points" button — always available after a run; the editor
+    // opens on click. URLs fall back to job_id-based paths if the server didn't
+    // include them explicitly, so it works as long as the pipeline wrote
+    // edit_data.json and the server serves /result/<job>/<file>.
+    const openBtn = document.getElementById('openEditor');
+    openBtn.style.display = 'inline-block';
+    openBtn.onclick = () => {
+      const editUrl = data.edit_data_url ||
+        (data.job_id ? ('/result/' + data.job_id + '/edit_data.json') : null);
+      const inputUrl = data.input_url ||
+        (data.job_id ? ('/result/' + data.job_id + '/input.png') : null);
+      if (!editUrl || !inputUrl) {
+        alert('This run has no editable data. Update the local pipeline/server to the latest and re-run.');
+        return;
+      }
+      initEditor({ edit_data_url: editUrl, input_url: inputUrl }).then(() => {
+        window._edOpenArg = { edit_data_url: editUrl, input_url: inputUrl };
+        document.getElementById('editor').scrollIntoView({ behavior: 'smooth' });
+      }).catch(e => {
+        console.error('editor init failed:', e);
+        alert('Could not open editor (' + e.message + '). Make sure the latest ' +
+              'server.py and pipeline are in place and re-run.');
+      });
+    };
+    // "Run Step 5 correction" button — B&W only, appears after a detection run.
+    // It re-runs with correction applied on top of the Step-4 result.
+    const step5 = document.getElementById('btnStep5');
+    if (step5) {
+      step5.style.display = (APP_MODE === 'bw') ? 'inline-block' : 'none';
+    }
+  } catch (err) {
+    alert('Failed: ' + err.message);
+  } finally {
+    document.getElementById('run').disabled = false;
+    const s5 = document.getElementById('btnStep5');
+    if (s5) s5.disabled = false;
+    document.getElementById('spinner').style.display = 'none';
+  }
+}
+document.getElementById('run').addEventListener('click', () => runDigitize(false));
+document.getElementById('btnStep5').addEventListener('click', () => runDigitize(true));
+
+/* ---------------- Human-assist point editor ---------------- */
+let ED = null;
+let edImg = new Image();
+let edScale = 1;
+let edBaseScale = 1;
+let edZoom = 1;
+let edSel = 0;
+let edSelPt = null;
+let edDragging = null;
+let edViewFilter = null;   // null = show all symbols; otherwise a curve index (show only that symbol)
+const edCanvas = document.getElementById('editCanvas');
+const edCtx = edCanvas.getContext('2d');
+
+function pxToData(px, ax) {
+  const {p0, p1, v0, v1, log} = ax;
+  if (p1 === p0) return v0;
+  const t = (px - p0) / (p1 - p0);
+  if (log) {
+    const l0 = Math.log10(v0), l1 = Math.log10(v1);
+    return Math.pow(10, l0 + t * (l1 - l0));
+  }
+  return v0 + t * (v1 - v0);
+}
+
+async function initEditor(data) {
+  const resp = await fetch(data.edit_data_url + '?t=' + Date.now());
+  ED = await resp.json();
+  edImg = new Image();
+  edImg.onload = () => {
+    const maxW = 600;
+    edBaseScale = Math.min(1, maxW / edImg.width);
+    edZoom = 1;
+    edScale = edBaseScale * edZoom;
+    edCanvas.width = Math.round(edImg.width * edScale);
+    edCanvas.height = Math.round(edImg.height * edScale);
+    edSel = 0; edSelPt = null; edViewFilter = null;
+    updateZoomLabel();
+    buildCurvePicker();
+    drawEditor();
+    recompute();
+    document.getElementById('editor').style.display = 'block';
+  };
+  edImg.src = data.input_url + '?t=' + Date.now();
+}
+
+function applyZoom(newZoom, anchor) {
+  if (!ED) return;
+  const old = edScale;
+  edZoom = Math.max(0.5, Math.min(6, newZoom));
+  edScale = edBaseScale * edZoom;
+  const sc = document.getElementById('editScroll');
+  // keep the anchor point (or center) stable while zooming
+  const ax = anchor ? anchor.x : (sc.scrollLeft + sc.clientWidth / 2);
+  const ay = anchor ? anchor.y : (sc.scrollTop + sc.clientHeight / 2);
+  const imgX = ax / old, imgY = ay / old;
+  edCanvas.width = Math.round(edImg.width * edScale);
+  edCanvas.height = Math.round(edImg.height * edScale);
+  drawEditor();
+  updateZoomLabel();
+  sc.scrollLeft = imgX * edScale - (anchor ? anchor.clientX : sc.clientWidth / 2);
+  sc.scrollTop = imgY * edScale - (anchor ? anchor.clientY : sc.clientHeight / 2);
+}
+function updateZoomLabel() {
+  const el = document.getElementById('edZoomLabel');
+  if (el) el.textContent = Math.round(edZoom * 100) + '%';
+}
+document.getElementById('edZoomIn').onclick = () => applyZoom(edZoom * 1.25);
+document.getElementById('edZoomOut').onclick = () => applyZoom(edZoom / 1.25);
+document.getElementById('edZoomFit').onclick = () => applyZoom(1);
+document.getElementById('editScroll').addEventListener('wheel', e => {
+  if (!e.ctrlKey || !ED) return;               // Ctrl+wheel zooms
+  e.preventDefault();
+  const r = edCanvas.getBoundingClientRect();
+  const sc = document.getElementById('editScroll');
+  applyZoom(edZoom * (e.deltaY < 0 ? 1.15 : 1 / 1.15),
+            { x: e.clientX - r.left, y: e.clientY - r.top,
+              clientX: e.clientX - sc.getBoundingClientRect().left,
+              clientY: e.clientY - sc.getBoundingClientRect().top });
+}, { passive: false });
+
+function rgbCss(c) { return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')'; }
+
+function buildCurvePicker() {
+  const box = document.getElementById('curvePicker');
+  box.innerHTML = '<span class="hint" style="margin-right:6px;">Show:</span>';
+  // "All" button — show every symbol at once.
+  const allBtn = document.createElement('button');
+  allBtn.textContent = 'All symbols';
+  allBtn.className = (edViewFilter === null) ? 'active' : '';
+  allBtn.onclick = () => { edViewFilter = null; edSelPt = null; buildCurvePicker(); drawEditor(); };
+  box.appendChild(allBtn);
+  // one button per symbol/series — click to view+edit ONLY that symbol.
+  ED.curves.forEach((c, i) => {
+    const b = document.createElement('button');
+    b.innerHTML = '<span class="swatch" style="background:' + rgbCss(c.rgb) +
+                  ';border:1px solid #999;"></span> ' + (c.label || c.name);
+    b.className = (edViewFilter === i) ? 'active' : '';
+    b.onclick = () => { edViewFilter = i; edSel = i; edSelPt = null; buildCurvePicker(); drawEditor(); };
+    box.appendChild(b);
+  });
+}
+
+function drawEditor() {
+  if (!ED) return;
+  edCtx.clearRect(0, 0, edCanvas.width, edCanvas.height);
+  edCtx.drawImage(edImg, 0, 0, edCanvas.width, edCanvas.height);
+  ED.curves.forEach((c, ci) => {
+    if (edViewFilter !== null && ci !== edViewFilter) return;   // show only the selected symbol
+    c.points.forEach((p, pi) => {
+      const x = p.x * edScale, y = p.y * edScale;
+      const sel = edSelPt && edSelPt.ci === ci && edSelPt.pi === pi;
+      edCtx.beginPath();
+      edCtx.arc(x, y, sel ? 7 : 5, 0, 2 * Math.PI);
+      edCtx.fillStyle = rgbCss(c.rgb);
+      edCtx.fill();
+      edCtx.lineWidth = sel ? 3 : 1.5;
+      edCtx.strokeStyle = sel ? '#000' : '#fff';
+      edCtx.stroke();
+    });
+  });
+}
+
+function edPos(e) {
+  const r = edCanvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * (edCanvas.width / r.width),
+           y: (e.clientY - r.top) * (edCanvas.height / r.height) };
+}
+function hitPoint(cx, cy) {
+  for (let ci = 0; ci < ED.curves.length; ci++) {
+    if (edViewFilter !== null && ci !== edViewFilter) continue;   // ignore hidden symbols
+    const pts = ED.curves[ci].points;
+    for (let pi = 0; pi < pts.length; pi++) {
+      const dx = pts[pi].x * edScale - cx, dy = pts[pi].y * edScale - cy;
+      if (dx * dx + dy * dy <= 81) return { ci, pi };
+    }
+  }
+  return null;
+}
+edCanvas.addEventListener('pointerdown', e => {
+  if (!ED) return;
+  const p = edPos(e);
+  const hit = hitPoint(p.x, p.y);
+  if (hit) {
+    edSel = hit.ci; edSelPt = hit; edDragging = hit;
+    buildCurvePicker();
+  } else {
+    ED.curves[edSel].points.push({ x: Math.round(p.x / edScale), y: Math.round(p.y / edScale) });
+    edSelPt = { ci: edSel, pi: ED.curves[edSel].points.length - 1 };
+    recompute();                 // live update on add
+  }
+  drawEditor();
+  edCanvas.setPointerCapture(e.pointerId);
+});
+edCanvas.addEventListener('pointermove', e => {
+  if (!edDragging) return;
+  const p = edPos(e);
+  const pt = ED.curves[edDragging.ci].points[edDragging.pi];
+  pt.x = Math.round(Math.max(0, Math.min(ED.image.width, p.x / edScale)));
+  pt.y = Math.round(Math.max(0, Math.min(ED.image.height, p.y / edScale)));
+  drawEditor();
+  scheduleRecompute();           // live update while dragging (throttled)
+});
+edCanvas.addEventListener('pointerup', () => { if (edDragging) { edDragging = null; recompute(); } });
+
+// coalesce rapid drag updates into one recompute per animation frame
+let _recompPending = false;
+function scheduleRecompute() {
+  if (_recompPending) return;
+  _recompPending = true;
+  requestAnimationFrame(() => { _recompPending = false; recompute(); });
+}
+
+function deleteSelected() {
+  if (!edSelPt) return;
+  ED.curves[edSelPt.ci].points.splice(edSelPt.pi, 1);
+  edSelPt = null; drawEditor(); recompute();   // live update on delete
+}
+document.getElementById('edDelete').onclick = deleteSelected;
+window.addEventListener('keydown', e => {
+  if ((e.key === 'Delete' || e.key === 'Backspace') && edSelPt &&
+      document.getElementById('editor').style.display !== 'none') {
+    e.preventDefault(); deleteSelected();
+  }
+});
+document.getElementById('edReset').onclick = () => { if (window._edOpenArg) initEditor(window._edOpenArg); };
+
+function recompute() {
+  if (!ED) return;
+  const cal = ED.calibration;
+  const rows = [];
+  ED.curves.forEach(c => {
+    const label = c.label || c.name;
+    c.points.slice().sort((a, b) => a.x - b.x).forEach(p => {
+      let dx = null, dy = null;
+      if (cal) { dx = pxToData(p.x, cal.x); dy = pxToData(p.y, cal.y); }
+      rows.push({ label, rgb: c.rgb, px: p.x, py: p.y, dx, dy });
+    });
+  });
+  drawRecon(rows);
+  drawTable(rows);
+  window._edRows = rows;
+  document.getElementById('edStatus').textContent =
+    rows.length + ' points' + (cal ? '' : ' (no axis calibration — values are pixels)');
+}
+document.getElementById('edRecompute').onclick = recompute;
+
+function drawRecon(rows) {
+  const cv = document.getElementById('reconCanvas');
+  const c = cv.getContext('2d');
+  // Reconstructed plot keeps a stable FIT size (independent of the edit canvas
+  // zoom) so zooming the image doesn't blow the recon canvas up off-screen.
+  const rw = Math.max(360, Math.round((edImg && edImg.width ? edImg.width : 600) * edBaseScale));
+  const rh = Math.max(240, Math.round((edImg && edImg.height ? edImg.height : 400) * edBaseScale));
+  cv.width = rw; cv.height = rh;
+  c.fillStyle = '#fff'; c.fillRect(0, 0, cv.width, cv.height);
+  const cal = ED.calibration;
+  const M = { l: 46, r: 12, t: 12, b: 30 };
+  const W = cv.width - M.l - M.r, H = cv.height - M.t - M.b;
+  const useData = !!cal;
+  let xs, ys, xlog = false, ylog = false;
+  if (useData) {
+    xlog = cal.x.log; ylog = cal.y.log;
+    xs = rows.map(r => r.dx); ys = rows.map(r => r.dy);
+  } else {
+    xs = rows.map(r => r.px); ys = rows.map(r => -r.py);
+  }
+  if (!rows.length) return;
+  let xmin = Math.min(...xs), xmax = Math.max(...xs),
+      ymin = Math.min(...ys), ymax = Math.max(...ys);
+  const fx = v => {
+    let t;
+    if (xlog) t = (Math.log10(v) - Math.log10(xmin)) / ((Math.log10(xmax) - Math.log10(xmin)) || 1);
+    else t = (v - xmin) / ((xmax - xmin) || 1);
+    return M.l + t * W;
+  };
+  const fy = v => {
+    let t;
+    if (ylog) t = (Math.log10(v) - Math.log10(ymin)) / ((Math.log10(ymax) - Math.log10(ymin)) || 1);
+    else t = (v - ymin) / ((ymax - ymin) || 1);
+    return M.t + (1 - t) * H;
+  };
+  c.strokeStyle = '#333'; c.lineWidth = 1;
+  c.beginPath(); c.moveTo(M.l, M.t); c.lineTo(M.l, M.t + H); c.lineTo(M.l + W, M.t + H); c.stroke();
+  const byLabel = {};
+  rows.forEach(r => { (byLabel[r.label] = byLabel[r.label] || []).push(r); });
+  Object.values(byLabel).forEach(list => {
+    list.sort((a, b) => (useData ? a.dx - b.dx : a.px - b.px));
+    c.strokeStyle = rgbCss(list[0].rgb); c.fillStyle = rgbCss(list[0].rgb); c.lineWidth = 1.5;
+    c.beginPath();
+    list.forEach((r, i) => {
+      const X = fx(useData ? r.dx : r.px), Y = fy(useData ? r.dy : -r.py);
+      if (i === 0) c.moveTo(X, Y); else c.lineTo(X, Y);
+    });
+    c.stroke();
+    list.forEach(r => {
+      const X = fx(useData ? r.dx : r.px), Y = fy(useData ? r.dy : -r.py);
+      c.beginPath(); c.arc(X, Y, 3, 0, 2 * Math.PI); c.fill();
+    });
+  });
+  c.fillStyle = '#333'; c.font = '10px sans-serif';
+  c.fillText(('' + (Math.round(xmin * 100) / 100)), M.l, M.t + H + 12);
+  c.fillText(('' + (Math.round(xmax * 100) / 100)), M.l + W - 24, M.t + H + 12);
+  c.fillText('' + (Math.round(ymax * 100) / 100), 2, M.t + 8);
+  c.fillText('' + (Math.round(ymin * 100) / 100), 2, M.t + H);
+}
+
+function drawTable(rows) {
+  const wrap = document.getElementById('edTableWrap');
+  let html = '<table style="border-collapse:collapse; font-size:12px; width:100%;">' +
+    '<tr style="position:sticky; top:0; background:#305496; color:#fff;">' +
+    '<th style="padding:4px 8px; text-align:left;">curve (legend label)</th>' +
+    '<th style="padding:4px 8px;">data_x</th><th style="padding:4px 8px;">data_y</th>' +
+    '<th style="padding:4px 8px;">px</th><th style="padding:4px 8px;">py</th></tr>';
+  rows.forEach(r => {
+    const chip = '<span class="swatch" style="background:' + rgbCss(r.rgb) +
+                 ';border:1px solid #999; vertical-align:middle; margin-right:5px;"></span>';
+    const dx = r.dx == null ? '' : (+r.dx).toPrecision(4);
+    const dy = r.dy == null ? '' : (+r.dy).toPrecision(4);
+    html += '<tr style="border-bottom:1px solid #eee;">' +
+      '<td style="padding:3px 8px;">' + chip + r.label + '</td>' +
+      '<td style="padding:3px 8px; text-align:right;">' + dx + '</td>' +
+      '<td style="padding:3px 8px; text-align:right;">' + dy + '</td>' +
+      '<td style="padding:3px 8px; text-align:right; color:#999;">' + r.px + '</td>' +
+      '<td style="padding:3px 8px; text-align:right; color:#999;">' + r.py + '</td></tr>';
+  });
+  html += '</table>';
+  wrap.innerHTML = html;
+}
+
+document.getElementById('edCsv').onclick = () => {
+  const rows = window._edRows || [];
+  let csv = 'curve,data_x,data_y,pixel_x,pixel_y\n';
+  rows.forEach(r => {
+    const lab = '"' + String(r.label).replace(/"/g, '""') + '"';
+    csv += [lab, r.dx == null ? '' : r.dx, r.dy == null ? '' : r.dy, r.px, r.py].join(',') + '\n';
+  });
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'corrected_data.csv'; a.click();
+};
+</script>
+</body>
+</html>

@@ -66,6 +66,7 @@ import math
 import random
 import importlib.util
 from collections import defaultdict, Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
 import numpy as np
@@ -93,6 +94,10 @@ X_APPROX         = 8.0    # px tolerance for same-class close-pair conflict chec
 RENDER_MARKER_PT = 5.0    # marker size (pt) for rendered plots
 L_STAR_GAIN_THRESH = 1e-4 # threshold for current-strategy l* gain; below this
                            # skip directly to old strategy
+OLD_STRATEGY_MAX_SEGS = 5  # (D) limit Old strategy to top-N L_t segments
+# (E) ThreadPoolExecutor workers: auto-detect physical CPU cores, cap at 16
+PARALLEL_WORKERS = min(os.cpu_count() or 4, 16)
+BATCH_PATIENCE    = 2       # (F) stop after this many consecutive no-improvement batches
 
 SYM_COLORS = {
     'filled_circle':       '#0077BB',
@@ -142,6 +147,38 @@ ACTION_COLORS = {
 # Module loading helper
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Legend-area exclusion helper
+# ---------------------------------------------------------------------------
+
+def _in_legend(cx, cy, legend_box):
+    """Return True if pixel (cx, cy) falls inside the legend bounding box."""
+    if legend_box is None:
+        return False
+    lx0, ly0, lx1, ly1 = legend_box
+    return lx0 <= cx <= lx1 and ly0 <= cy <= ly1
+
+
+def _filter_legend(pts, legend_box):
+    """Remove any point whose (cx, cy) is inside legend_box.
+    Works for both 'cx'/'cy' keys (Stage 5 internal) and
+    'cx_px'/'cy_px' keys (GUI detections).
+    """
+    if legend_box is None:
+        return pts
+    kept, removed = [], []
+    for p in pts:
+        cx = p.get('cx', p.get('cx_px', None))
+        cy = p.get('cy', p.get('cy_px', None))
+        if cx is None or cy is None or _in_legend(cx, cy, legend_box):
+            removed.append(p)
+        else:
+            kept.append(p)
+    if removed:
+        print(f'  [legend filter] removed {len(removed)} pts inside legend_box')
+    return kept
+
+
 def _load_module(name, path):
     """Dynamically load a Python module from an arbitrary file path."""
     spec = importlib.util.spec_from_file_location(name, path)
@@ -149,6 +186,94 @@ def _load_module(name, path):
     spec.loader.exec_module(mod)
     sys.modules[name] = mod
     return mod
+
+
+# ---------------------------------------------------------------------------
+# (B) Conflict-pair caching helper
+# ---------------------------------------------------------------------------
+
+def _conflict_pairs_cached(P, x_approx):
+    """Return frozenset of conflict-pair keys for active points in P.
+    Compute once per call; callers should cache the result for P_baseline.
+    """
+    active = [p for p in P if p.get('class_name') != 'suppressed']
+    pairs  = set()
+    for i in range(len(active)):
+        for j in range(i + 1, len(active)):
+            if active[i]['class_name'] == active[j]['class_name']:
+                d = math.hypot(active[i]['cx'] - active[j]['cx'],
+                               active[i]['cy'] - active[j]['cy'])
+                if d <= x_approx:
+                    key = (active[i]['class_name'],
+                           round(active[i]['cx']), round(active[i]['cy']),
+                           round(active[j]['cx']), round(active[j]['cy']))
+                    pairs.add(key)
+    return pairs
+
+
+def has_new_conflicts(baseline_pairs, P_new, x_approx):
+    """Return True if P_new introduces any conflict not in baseline_pairs."""
+    return bool(_conflict_pairs_cached(P_new, x_approx) - baseline_pairs)
+
+
+# ---------------------------------------------------------------------------
+# (F) Batched parallel perturbation evaluator with early-stop
+# ---------------------------------------------------------------------------
+
+def _eval_perturbs_batched(valid_perturbs, eval_fn, current_best_d,
+                           batch_size=None, patience=None):
+    """Evaluate perturbations in parallel batches with early-stop.
+
+    Parameters
+    ----------
+    valid_perturbs : list of (action, point_list)
+        Ordered list of candidate perturbations to evaluate.
+    eval_fn : callable
+        Function that takes (action, point_list) and returns (dist, pt, act).
+        Must be picklable / thread-safe (uses ThreadPoolExecutor).
+    current_best_d : float
+        Current best 1-SSIM distance; improvement means d < current_best_d - 1e-7.
+    batch_size : int or None
+        Number of perturbations per parallel batch.  Defaults to PARALLEL_WORKERS.
+    patience : int or None
+        Stop after this many consecutive no-improvement batches.
+        Defaults to BATCH_PATIENCE.
+
+    Returns
+    -------
+    (best_d, best_P, best_action)  — best found, or (current_best_d, None, None)
+    if no improvement was found.
+    """
+    if not valid_perturbs:
+        return current_best_d, None, None
+
+    bs  = batch_size or PARALLEL_WORKERS
+    pat = patience  if patience is not None else BATCH_PATIENCE
+
+    best_d      = current_best_d
+    best_P      = None
+    best_action = None
+    no_improve_streak = 0
+
+    for batch_start in range(0, len(valid_perturbs), bs):
+        batch = valid_perturbs[batch_start: batch_start + bs]
+
+        batch_improved = False
+        with ThreadPoolExecutor(max_workers=bs) as ex:
+            for d, pt, act in ex.map(eval_fn, batch):
+                if d < best_d - 1e-7:
+                    best_d, best_P, best_action = d, pt, act
+                    batch_improved = True
+
+        if batch_improved:
+            # Found improvement in this batch — stop immediately
+            break
+        else:
+            no_improve_streak += 1
+            if no_improve_streak >= pat:
+                break
+
+    return best_d, best_P, best_action
 
 
 # ---------------------------------------------------------------------------
@@ -166,9 +291,112 @@ def ssim_dist(A, B):
 # Rendering
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# OpenCV marker drawing helpers (B optimisation)
+# ---------------------------------------------------------------------------
+
+# Marker radius in pixels for the rendered image (RENDER_MARKER_PT is in pt
+# units; at DPI=100 one pt ≈ 1.39 px, so 5 pt ≈ 7 px radius).
+_CV_MARKER_R = 4   # half-size in px for cv2 marker drawing
+
+# Map class index → (shape_type, filled)
+#   shape_type: 'circle', 'square', 'triangle_up', 'triangle_down',
+#               'rhombus', 'x', 'plus'
+_CV_SHAPE = [
+    ('circle',        True),   # 0  filled_circle
+    ('circle',        False),  # 1  open_circle
+    ('square',        True),   # 2  filled_square
+    ('square',        False),  # 3  open_square
+    ('triangle_up',   False),  # 4  open_triangle
+    ('triangle_down', False),  # 5  open_inv_triangle
+    ('triangle_up',   True),   # 6  filled_triangle
+    ('triangle_down', True),   # 7  filled_inv_triangle
+    ('rhombus',       False),  # 8  open_rhombus
+    ('rhombus',       True),   # 9  filled_rhombus
+    ('x',             True),   # 10 x_marker
+    ('plus',          True),   # 11 plus_marker
+]
+
+
+def _cv_draw_marker(img, cx, cy, class_idx, r=_CV_MARKER_R):
+    """Draw a single marker onto img (BGR, in-place) using OpenCV."""
+    ci = int(class_idx) % len(_CV_SHAPE)
+    shape, filled = _CV_SHAPE[ci]
+    cx, cy = int(round(cx)), int(round(cy))
+    BLACK = (0, 0, 0)
+    WHITE = (255, 255, 255)
+    lw = 1  # outline thickness
+
+    if shape == 'circle':
+        if filled:
+            cv2.circle(img, (cx, cy), r, BLACK, -1)
+        else:
+            cv2.circle(img, (cx, cy), r, BLACK, lw)
+            cv2.circle(img, (cx, cy), max(1, r - lw), WHITE, -1)
+
+    elif shape == 'square':
+        x0, y0 = cx - r, cy - r
+        x1, y1 = cx + r, cy + r
+        if filled:
+            cv2.rectangle(img, (x0, y0), (x1, y1), BLACK, -1)
+        else:
+            cv2.rectangle(img, (x0, y0), (x1, y1), BLACK, lw)
+            cv2.rectangle(img, (x0 + lw, y0 + lw), (x1 - lw, y1 - lw), WHITE, -1)
+
+    elif shape in ('triangle_up', 'triangle_down'):
+        if shape == 'triangle_up':
+            pts = np.array([
+                [cx,     cy - r],
+                [cx - r, cy + r],
+                [cx + r, cy + r],
+            ], dtype=np.int32)
+        else:
+            pts = np.array([
+                [cx,     cy + r],
+                [cx - r, cy - r],
+                [cx + r, cy - r],
+            ], dtype=np.int32)
+        if filled:
+            cv2.fillPoly(img, [pts], BLACK)
+        else:
+            cv2.polylines(img, [pts], isClosed=True, color=BLACK, thickness=lw)
+            # fill interior with white
+            inner = (pts * (r - lw) // r).astype(np.int32)
+            inner = inner + np.array([[cx, cy]], dtype=np.int32) - (inner.mean(axis=0)).astype(np.int32)
+            cv2.fillPoly(img, [inner], WHITE)
+
+    elif shape == 'rhombus':
+        pts = np.array([
+            [cx,     cy - r],
+            [cx + r, cy    ],
+            [cx,     cy + r],
+            [cx - r, cy    ],
+        ], dtype=np.int32)
+        if filled:
+            cv2.fillPoly(img, [pts], BLACK)
+        else:
+            cv2.polylines(img, [pts], isClosed=True, color=BLACK, thickness=lw)
+            inner = np.array([
+                [cx,         cy - r + lw],
+                [cx + r - lw, cy        ],
+                [cx,         cy + r - lw],
+                [cx - r + lw, cy        ],
+            ], dtype=np.int32)
+            cv2.fillPoly(img, [inner], WHITE)
+
+    elif shape == 'x':
+        cv2.line(img, (cx - r, cy - r), (cx + r, cy + r), BLACK, lw + 1)
+        cv2.line(img, (cx + r, cy - r), (cx - r, cy + r), BLACK, lw + 1)
+
+    elif shape == 'plus':
+        cv2.line(img, (cx - r, cy), (cx + r, cy), BLACK, lw + 1)
+        cv2.line(img, (cx, cy - r), (cx, cy + r), BLACK, lw + 1)
+
+
 def render_from_points(points, pa_shape, linewidth=1.0):
     """
     Render a synthetic chart image from a list of active point dicts.
+    Uses OpenCV for fast rendering (replaces matplotlib, ~5-10x speedup).
 
     Parameters
     ----------
@@ -184,134 +412,88 @@ def render_from_points(points, pa_shape, linewidth=1.0):
     -------
     BGR numpy array of shape (H, W, 3).
     """
-    from chart_marker_detector_v3 import (
-        CLASS_NAMES as _CN, N_SYMBOLS,
-        DPI, MARKER_PT, _MPL_MARKERS,
-    )
-
     H_pa, W_pa = pa_shape
+    img = np.full((H_pa, W_pa, 3), 255, dtype=np.uint8)  # white background
+
     active = [p for p in points if p.get('class_name') != 'suppressed']
+
+    # Build class_idx for each point
+    _CN = ['filled_circle', 'open_circle', 'filled_square', 'open_square',
+           'open_triangle', 'open_inv_triangle', 'filled_triangle',
+           'filled_inv_triangle', 'open_rhombus', 'filled_rhombus',
+           'x_marker', 'plus_marker']
 
     by_class = defaultdict(list)
     for p in active:
-        ci = p.get('class_idx', _CN.index(p['class_name']))
+        cn = p.get('class_name', '')
+        ci = p.get('class_idx', _CN.index(cn) if cn in _CN else 0)
         by_class[ci].append((p['cx'], p['cy']))
 
-    fig_w_in = W_pa / DPI
-    fig_h_in = H_pa / DPI
-    fig, ax = plt.subplots(figsize=(fig_w_in, fig_h_in), dpi=DPI)
-    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-    fig.patch.set_facecolor('white')
-    ax.set_facecolor('white')
-    ax.set_xlim(0, W_pa)
-    ax.set_ylim(0, H_pa)
-    ax.axis('off')
+    lw_px = max(1, int(round(linewidth)))
 
+    # Draw connecting lines first (lower z-order)
     for ci, pts in by_class.items():
         if len(pts) < 2:
             continue
         pts_sorted = sorted(pts, key=lambda p: p[0])
-        xs = [p[0] for p in pts_sorted]
-        ys = [H_pa - p[1] for p in pts_sorted]   # flip y (matplotlib origin = bottom)
-        ax.plot(xs, ys, color='black', linewidth=linewidth, zorder=ci)
+        for i in range(len(pts_sorted) - 1):
+            x0, y0 = int(round(pts_sorted[i][0])),     int(round(pts_sorted[i][1]))
+            x1, y1 = int(round(pts_sorted[i + 1][0])), int(round(pts_sorted[i + 1][1]))
+            cv2.line(img, (x0, y0), (x1, y1), (0, 0, 0), lw_px)
 
-    ms_pt = RENDER_MARKER_PT
+    # Draw markers on top (higher z-order)
     for ci, pts in by_class.items():
-        mcode, filled = _MPL_MARKERS[ci]
-        fc = 'black' if filled else 'white'
         for (px, py) in pts:
-            py_mpl = H_pa - py
-            ax.plot(px, py_mpl,
-                    marker=mcode, markersize=ms_pt,
-                    color='black', markerfacecolor=fc,
-                    markeredgecolor='black', markeredgewidth=0.8,
-                    linestyle='none', zorder=N_SYMBOLS + ci * 3 + 1)
+            _cv_draw_marker(img, px, py, ci)
 
-    fig.canvas.draw()
-    buf  = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
-    buf  = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))
-    rgba = buf.astype(np.float32) / 255.0
-    alpha    = rgba[:, :, 3:4]
-    white_bg = np.ones_like(rgba[:, :, :3])
-    rgb_comp = rgba[:, :, :3] * alpha + white_bg * (1.0 - alpha)
-    img_bgr  = cv2.cvtColor((rgb_comp * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-    plt.close(fig)
-
-    if img_bgr.shape[:2] != (H_pa, W_pa):
-        img_bgr = cv2.resize(img_bgr, (W_pa, H_pa))
-    return img_bgr
+    return img
 
 
 def _render_on_canvas(points, pa_shape, linewidth=3.0, underlay_bgr=None):
     """
-    Render segments and symbols onto a canvas with transparent background.
+    Render segments and symbols onto a canvas using OpenCV (fast path).
     If underlay_bgr is provided (H x W x 3 uint8), it is used as the
     background instead of white -- so l* drawn beforehand is underneath
     (z-order last for l*).
     """
-    from chart_marker_detector_v3 import (
-        CLASS_NAMES as _CN, N_SYMBOLS,
-        DPI, MARKER_PT, _MPL_MARKERS,
-    )
     H_pa, W_pa = pa_shape
+
+    if underlay_bgr is not None:
+        img = cv2.resize(underlay_bgr, (W_pa, H_pa)).copy()
+    else:
+        img = np.full((H_pa, W_pa, 3), 255, dtype=np.uint8)
+
     active = [p for p in points if p.get('class_name') != 'suppressed']
+
+    _CN = ['filled_circle', 'open_circle', 'filled_square', 'open_square',
+           'open_triangle', 'open_inv_triangle', 'filled_triangle',
+           'filled_inv_triangle', 'open_rhombus', 'filled_rhombus',
+           'x_marker', 'plus_marker']
+
     by_class = defaultdict(list)
     for p in active:
-        ci = p.get('class_idx', _CN.index(p['class_name']))
+        cn = p.get('class_name', '')
+        ci = p.get('class_idx', _CN.index(cn) if cn in _CN else 0)
         by_class[ci].append((p['cx'], p['cy']))
 
-    fig_w_in = W_pa / DPI
-    fig_h_in = H_pa / DPI
-    fig, ax = plt.subplots(figsize=(fig_w_in, fig_h_in), dpi=DPI)
-    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-    # Use transparent background so gaps let the underlay show through
-    fig.patch.set_alpha(0.0)
-    ax.set_facecolor('none')
-    ax.set_xlim(0, W_pa)
-    ax.set_ylim(0, H_pa)
-    ax.axis('off')
+    lw_px = max(1, int(round(linewidth)))
 
+    # Draw connecting lines first
     for ci, pts in by_class.items():
         if len(pts) < 2:
             continue
         pts_sorted = sorted(pts, key=lambda p: p[0])
-        xs = [p[0] for p in pts_sorted]
-        ys = [H_pa - p[1] for p in pts_sorted]
-        ax.plot(xs, ys, color='black', linewidth=linewidth, zorder=ci)
+        for i in range(len(pts_sorted) - 1):
+            x0, y0 = int(round(pts_sorted[i][0])),     int(round(pts_sorted[i][1]))
+            x1, y1 = int(round(pts_sorted[i + 1][0])), int(round(pts_sorted[i + 1][1]))
+            cv2.line(img, (x0, y0), (x1, y1), (0, 0, 0), lw_px)
 
-    ms_pt = RENDER_MARKER_PT
+    # Draw markers on top
     for ci, pts in by_class.items():
-        mcode, filled = _MPL_MARKERS[ci]
-        fc = 'black' if filled else 'white'
         for (px, py) in pts:
-            py_mpl = H_pa - py
-            ax.plot(px, py_mpl,
-                    marker=mcode, markersize=ms_pt,
-                    color='black', markerfacecolor=fc,
-                    markeredgecolor='black', markeredgewidth=0.8,
-                    linestyle='none', zorder=N_SYMBOLS + ci * 3 + 1)
+            _cv_draw_marker(img, px, py, ci)
 
-    fig.canvas.draw()
-    buf  = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
-    buf  = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))
-    rgba = buf.astype(np.float32) / 255.0
-    alpha = rgba[:, :, 3:4]
-    buf_h, buf_w = rgba.shape[:2]
-
-    if underlay_bgr is not None:
-        # Composite: drawn content on top, underlay shows through transparent gaps
-        underlay_resized = cv2.resize(underlay_bgr, (buf_w, buf_h))
-        underlay_rgb = cv2.cvtColor(underlay_resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        rgb_comp = rgba[:, :, :3] * alpha + underlay_rgb * (1.0 - alpha)
-    else:
-        white_bg = np.ones_like(rgba[:, :, :3])
-        rgb_comp = rgba[:, :, :3] * alpha + white_bg * (1.0 - alpha)
-
-    img_bgr = cv2.cvtColor((rgb_comp * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-    plt.close(fig)
-    if img_bgr.shape[:2] != (H_pa, W_pa):
-        img_bgr = cv2.resize(img_bgr, (W_pa, H_pa))
-    return img_bgr
+    return img
 
 
 # ---------------------------------------------------------------------------
@@ -461,22 +643,27 @@ def _select_l_star_current(L_refined, I_t, points, lw=1):
     and symbols are rendered ON TOP with their normal appearance.  This means
     l* is only visible in the true gaps of the render -- it is hidden beneath
     rendered lines and beneath the white interiors of open symbols (z-order last).
+    Parallelised with ThreadPoolExecutor (numpy/OpenCV release the GIL).
     """
     H, W = I_t.shape[:2]
 
-    best_l, best_d = None, -float('inf')
-    for seg in L_refined:
-        # 1. Draw l* on a white canvas first
+    def _eval_seg(seg):
         underlay = np.full((H, W, 3), 255, dtype=np.uint8)
         cv2.line(underlay,
                  (int(seg[0]), int(seg[1])),
                  (int(seg[2]), int(seg[3])),
                  (0, 0, 0), lw)
-        # 2. Render segments + symbols on top (l* is z-order last)
         I_ov = _render_on_canvas(points, (H, W), linewidth=3.0, underlay_bgr=underlay)
-        d = ssim_dist(I_t, I_ov)
-        if d > best_d:
-            best_d, best_l = d, seg
+        return ssim_dist(I_t, I_ov), seg
+
+    if not L_refined:
+        return None, -float('inf')
+
+    best_l, best_d = None, -float('inf')
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as ex:
+        for d, seg in ex.map(_eval_seg, L_refined):
+            if d > best_d:
+                best_d, best_l = d, seg
     return best_l, best_d
 
 
@@ -516,24 +703,34 @@ def _rank_all_l_star_old(L_t, I0, lw=1):
 
     Same z-order-last compositing as _select_l_star_old, but returns the
     full ranked list instead of just the best.
+    Parallelised with ThreadPoolExecutor (numpy/OpenCV release the GIL).
     """
     H, W = I0.shape[:2]
     I0_gray   = cv2.cvtColor(I0, cv2.COLOR_BGR2GRAY)
     raw_mask  = (I0_gray < 250)
     kernel    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     orig_mask = cv2.dilate(raw_mask.astype(np.uint8), kernel).astype(bool)
+    # Pre-copy I0 slice for thread safety (read-only, but explicit copy avoids
+    # any potential numpy view aliasing across threads)
+    I0_vals   = I0[orig_mask]  # shape (N, 3), read-only reference is fine
 
-    scored = []
-    for seg in L_t:
+    def _eval_seg(seg):
         canvas = np.full((H, W, 3), 255, dtype=np.uint8)
         cv2.line(canvas,
                  (int(seg[0]), int(seg[1])),
                  (int(seg[2]), int(seg[3])),
                  (0, 0, 0), lw)
-        I_ov = canvas.copy()
-        I_ov[orig_mask] = I0[orig_mask]
-        d = ssim_dist(I0, I_ov)
-        scored.append((seg, d))
+        canvas[orig_mask] = I0_vals
+        d = ssim_dist(I0, canvas)
+        return seg, d
+
+    if not L_t:
+        return []
+
+    scored = []
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as ex:
+        for seg, d in ex.map(_eval_seg, L_t):
+            scored.append((seg, d))
 
     scored.sort(key=lambda x: x[1], reverse=True)
     return scored
@@ -544,7 +741,7 @@ def _rank_all_l_star_old(L_t, I0, lw=1):
 # ---------------------------------------------------------------------------
 
 def run_one_iteration(P_in, S_in, I0, L_refined, known_classes,
-                      nms_window=None):
+                      nms_window=None, legend_box=None):
     """
     Execute one greedy correction step.
 
@@ -558,6 +755,9 @@ def run_one_iteration(P_in, S_in, I0, L_refined, known_classes,
     nms_window    : float or None
         Sliding-window width for post-perturbation NMS.
         If None, NMS is skipped.
+    legend_box    : (x0,y0,x1,y1) or None
+        If provided, candidate locations and ACTIVATE points that fall
+        inside this box are rejected before perturbation evaluation.
 
     Returns a state dict with keys:
       converged, P_in, P_out, S_in, S_out,
@@ -566,13 +766,19 @@ def run_one_iteration(P_in, S_in, I0, L_refined, known_classes,
       added, removed, action, best_dist, baseline, improved,
       n_valid_perturbs, n_sup_near
     """
-    from segment_detector import detect_debug
+    _seg_det_mod = _load_module('segment_detector',
+                               os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            '3_segment_detection_v2.py'))
+    detect_debug = _seg_det_mod.detect_debug
 
     H, W = I0.shape[:2]
     # Rule i: render I_t with thick lines so the l* overlay stands out
     I_t  = render_from_points(P_in, (H, W), linewidth=3.0)
 
-    seg_res = detect_debug(I_t)
+    # (A) Fast path for synthetic renders: fewer directions + smaller probe radius.
+    # I_t is a clean white-background image with simple black lines/markers,
+    # so the full 24-direction / radius-12 scan is overkill.
+    seg_res = detect_debug(I_t, n_dirs=8, probe_radius=6)
     L_t     = seg_res['segments']
 
     # Stage 1: current l* strategy
@@ -600,11 +806,16 @@ def run_one_iteration(P_in, S_in, I0, L_refined, known_classes,
         ry = float(best_l_star[3] if best_l_star[0] <= best_l_star[2] else best_l_star[1])
         anchor_left  = (lx, ly)
         anchor_right = (rx, ry)
-        cand_locs = [{'cx': anchor_left[0],  'cy': anchor_left[1]},
-                     {'cx': anchor_right[0], 'cy': anchor_right[1]}]
+        # Exclude anchor locs that fall inside the legend box
+        cand_locs = [c for c in [
+                         {'cx': anchor_left[0],  'cy': anchor_left[1]},
+                         {'cx': anchor_right[0], 'cy': anchor_right[1]},
+                     ] if not _in_legend(c['cx'], c['cy'], legend_box)]
 
         candidates, seen_ids = [], set()
         for anchor in [anchor_left, anchor_right]:
+            if _in_legend(anchor[0], anchor[1], legend_box):
+                continue
             for p in P_in:
                 pid = id(p)
                 if pid in seen_ids:
@@ -613,10 +824,15 @@ def run_one_iteration(P_in, S_in, I0, L_refined, known_classes,
                     candidates.append(p)
                     seen_ids.add(pid)
 
+        # Exclude suppressed points inside the legend box
         sup_near, seen_sup = [], set()
         for anchor in [anchor_left, anchor_right]:
+            if _in_legend(anchor[0], anchor[1], legend_box):
+                continue
             best_sup, best_d_sup = None, float('inf')
             for s in S_in:
+                if _in_legend(s['cx'], s['cy'], legend_box):
+                    continue
                 d = math.hypot(s['cx'] - anchor[0], s['cy'] - anchor[1])
                 if d <= PT_TOL and d < best_d_sup:
                     best_d_sup, best_sup = d, s
@@ -625,23 +841,39 @@ def run_one_iteration(P_in, S_in, I0, L_refined, known_classes,
                 seen_sup.add(id(best_sup))
 
         all_perturbs   = generate_perturbations(P_in, sup_near, cand_locs, known_classes)
-        valid_perturbs = [(a, pt) for a, pt in all_perturbs
-                          if count_new_conflicts(P_in, pt, X_APPROX) == 0]
+        # (B) Cache baseline conflict pairs once — avoids O(n²) recompute per perturbation
+        _baseline_pairs = _conflict_pairs_cached(P_in, X_APPROX)
+        # Also filter out any ADD/ACTIVATE result whose new point lands in legend
+        valid_perturbs = [
+            (a, pt) for a, pt in all_perturbs
+            if not has_new_conflicts(_baseline_pairs, pt, X_APPROX)
+            and not any(_in_legend(p['cx'], p['cy'], legend_box)
+                        for p in pt if p not in P_in)
+        ]
 
-        for act, pt in valid_perturbs:
-            # Apply post-perturbation NMS if the action adds a point
+        def _eval_perturb(args):
+            act, pt = args
             if nms_window is not None and act in ('ADD', 'ACTIVATE', 'REPLACE'):
                 pt, _ = post_perturbation_nms(pt, S_in, nms_window)
             d = ssim_dist(I0, render_from_points(pt, (H, W)))
-            if d < best_d:
-                best_d, best_P, best_action = d, pt, act
+            return d, pt, act
+
+        # (F) Batched early-stop: evaluate PARALLEL_WORKERS at a time;
+        #     stop as soon as any batch improves, or after BATCH_PATIENCE
+        #     consecutive no-improvement batches.
+        _bd, _bp, _ba = _eval_perturbs_batched(
+            valid_perturbs, _eval_perturb, best_d)
+        if _bp is not None:
+            best_d, best_P, best_action = _bd, _bp, _ba
 
         improved = best_d < baseline - 1e-7
 
-    # --- Old strategy: exhaustively iterate through ALL L_t segments ---
+    # --- Old strategy: top-N L_t segments only (D optimisation) ---
     if (use_old_strategy or not improved) and L_t:
         scored_lt = _rank_all_l_star_old(L_t, I0)
-        print(f"  Old strategy: {len(scored_lt)} L_t segments to try")
+        n_total = len(scored_lt)
+        scored_lt = scored_lt[:OLD_STRATEGY_MAX_SEGS]   # limit to top-N
+        print(f"  Old strategy: trying top {len(scored_lt)} of {n_total} L_t segments")
 
         for seg_rank, (old_l_star, old_l_diff) in enumerate(scored_lt, 1):
             lx2 = float(min(old_l_star[0], old_l_star[2]))
@@ -650,11 +882,16 @@ def run_one_iteration(P_in, S_in, I0, L_refined, known_classes,
             ry2 = float(old_l_star[3] if old_l_star[0] <= old_l_star[2] else old_l_star[1])
             anchor_left2  = (lx2, ly2)
             anchor_right2 = (rx2, ry2)
-            cand_locs2 = [{'cx': anchor_left2[0], 'cy': anchor_left2[1]},
-                          {'cx': anchor_right2[0], 'cy': anchor_right2[1]}]
+            # Exclude anchor locs inside the legend box
+            cand_locs2 = [c for c in [
+                              {'cx': anchor_left2[0], 'cy': anchor_left2[1]},
+                              {'cx': anchor_right2[0], 'cy': anchor_right2[1]},
+                          ] if not _in_legend(c['cx'], c['cy'], legend_box)]
 
             candidates2, seen_ids2 = [], set()
             for anchor in [anchor_left2, anchor_right2]:
+                if _in_legend(anchor[0], anchor[1], legend_box):
+                    continue
                 for p in P_in:
                     pid = id(p)
                     if pid in seen_ids2:
@@ -665,8 +902,12 @@ def run_one_iteration(P_in, S_in, I0, L_refined, known_classes,
 
             sup_near2, seen_sup2 = [], set()
             for anchor in [anchor_left2, anchor_right2]:
+                if _in_legend(anchor[0], anchor[1], legend_box):
+                    continue
                 best_sup2, best_d2 = None, float('inf')
                 for s in S_in:
+                    if _in_legend(s['cx'], s['cy'], legend_box):
+                        continue
                     d2 = math.hypot(s['cx'] - anchor[0], s['cy'] - anchor[1])
                     if d2 <= PT_TOL and d2 < best_d2:
                         best_d2, best_sup2 = d2, s
@@ -675,16 +916,34 @@ def run_one_iteration(P_in, S_in, I0, L_refined, known_classes,
                     seen_sup2.add(id(best_sup2))
 
             all_perturbs2   = generate_perturbations(P_in, sup_near2, cand_locs2, known_classes)
-            valid_perturbs2 = [(a, pt) for a, pt in all_perturbs2
-                               if count_new_conflicts(P_in, pt, X_APPROX) == 0]
+            # (B) Reuse cached baseline pairs (computed once above, or compute here if
+            #     current strategy was skipped — use try/except for safe local var check)
+            try:
+                _baseline_pairs
+            except NameError:
+                _baseline_pairs = _conflict_pairs_cached(P_in, X_APPROX)
+            # Filter out any ADD/ACTIVATE result whose new point lands in legend
+            valid_perturbs2 = [
+                (a, pt) for a, pt in all_perturbs2
+                if not has_new_conflicts(_baseline_pairs, pt, X_APPROX)
+                and not any(_in_legend(p['cx'], p['cy'], legend_box)
+                            for p in pt if p not in P_in)
+            ]
 
             local_best_d, local_best_P, local_best_action = best_d, best_P, best_action
-            for act, pt in valid_perturbs2:
-                if nms_window is not None and act in ('ADD', 'ACTIVATE', 'REPLACE'):
-                    pt, _ = post_perturbation_nms(pt, S_in, nms_window)
-                d = ssim_dist(I0, render_from_points(pt, (H, W)))
-                if d < local_best_d:
-                    local_best_d, local_best_P, local_best_action = d, pt, act
+
+            def _eval_perturb2(args):
+                act2, pt2 = args
+                if nms_window is not None and act2 in ('ADD', 'ACTIVATE', 'REPLACE'):
+                    pt2, _ = post_perturbation_nms(pt2, S_in, nms_window)
+                d2 = ssim_dist(I0, render_from_points(pt2, (H, W)))
+                return d2, pt2, act2
+
+            # (F) Batched early-stop for old strategy too
+            _bd2, _bp2, _ba2 = _eval_perturbs_batched(
+                valid_perturbs2, _eval_perturb2, local_best_d)
+            if _bp2 is not None:
+                local_best_d, local_best_P, local_best_action = _bd2, _bp2, _ba2
 
             if local_best_d < baseline - 1e-7:
                 best_d, best_P, best_action = local_best_d, local_best_P, local_best_action
@@ -814,8 +1073,13 @@ def _save_jpg(fig, path):
 # ---------------------------------------------------------------------------
 
 def build_iter_figure(iter_n, P_in, S_in, state,
-                      I0, I0_rgb, L_refined, out_path):
-    """Build and save the 5-panel per-iteration diagnostic figure."""
+                      I0, I0_rgb, L_refined, out_path,
+                      return_img=False):
+    """Build and save the 5-panel per-iteration diagnostic figure.
+
+    If return_img=True, also return the figure as a BGR numpy array
+    (for in-memory GUI diagnostics) in addition to saving the JPEG.
+    """
     I_t       = state['I_t']
     I_out     = state['I_out']
     l_star    = state['l_star']
@@ -937,8 +1201,20 @@ def build_iter_figure(iter_n, P_in, S_in, state,
         f'1-SSIM: {best_dist:.5f}',
         fontsize=10, fontweight='bold', y=1.02)
     plt.tight_layout(rect=[0, 0.07, 1, 1])
+
+    if return_img:
+        # Render to numpy array before saving
+        fig.canvas.draw()
+        buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+        img_bgr = cv2.cvtColor(buf[:, :, :3], cv2.COLOR_RGB2BGR)
+    else:
+        img_bgr = None
+
     _save_jpg(fig, out_path)
     print(f'    Saved: {out_path}')
+
+    return img_bgr
 
 
 # ---------------------------------------------------------------------------
@@ -1008,7 +1284,8 @@ def run_pipeline(plot_name, img_path, out_dir,
                  model_path, detector_py_path,
                  known_classes=None,
                  mode_xs=None,
-                 prep_info=None):
+                 prep_info=None,
+                 return_diag_imgs=False):
     """
     Run the full 4-stage pipeline for a single chart image.
 
@@ -1053,12 +1330,18 @@ def run_pipeline(plot_name, img_path, out_dir,
     if _this_dir not in sys.path:
         sys.path.insert(0, _this_dir)
 
-    from segment_detector import detect_debug
-    from refine_segments  import infer_x_grid, refine, grid_step
+    _seg_det_mod = _load_module('segment_detector',
+                               os.path.join(_this_dir, '3_segment_detection_v2.py'))
+    _refine_mod  = _load_module('refine_segments',
+                               os.path.join(_this_dir, '4_segment_refinement.py'))
+    detect_debug  = _seg_det_mod.detect_debug
+    infer_x_grid  = _refine_mod.infer_x_grid
+    refine        = _refine_mod.refine
+    grid_step     = _refine_mod.grid_step
 
     # Stage 1b: adaptive NMS detection
-    _adnms_path = os.path.join(_this_dir, '2_point_detection_adaptive_nms.py')
-    _adnms_mod  = _load_module('adaptive_nms_detection', _adnms_path)
+    _adnms_path = os.path.join(_this_dir, '2_point_detection_adaptive_nms_v2.py')
+    _adnms_mod  = _load_module('adaptive_nms_detection_v2', _adnms_path)
     detect_with_adaptive_nms = _adnms_mod.detect_with_adaptive_nms
 
     # ── Preprocessing: run if not already done externally ─────────────────
@@ -1087,6 +1370,15 @@ def run_pipeline(plot_name, img_path, out_dir,
         mode_xs = det_result['mode_xs']
     else:
         mode_xs = np.asarray(mode_xs)
+
+    # ── Legend-area exclusion: remove any point inside the legend box ──────
+    _legend_box = prep_info.get('legend_box', None) if prep_info else None
+    if _legend_box is not None:
+        print(f'  legend_box = {_legend_box}  → filtering P0 and S0')
+        P0 = _filter_legend(P0, _legend_box)
+        S0 = _filter_legend(S0, _legend_box)
+    # Store for use in run_one_iteration candidate filtering
+    _LEGEND_BOX = _legend_box
 
     cnt = {k: sum(1 for d in P0 if d['class_name'] == k) for k in known_classes}
     print(f"  P0 (active):     {len(P0)} pts  "
@@ -1129,11 +1421,13 @@ def run_pipeline(plot_name, img_path, out_dir,
     S_current  = S0
     history    = [(0, '--', len(P0), initial_dist, False)]
     iter_paths = []
+    diag_imgs  = []   # list of {title, img_bgr} for GUI diagnostics
 
     for t in range(1, T_MAX + 1):
         print(f"\n  -- Iteration {t} " + '-' * 40)
         state = run_one_iteration(P_current, S_current, I0, L_refined,
-                                  known_classes, nms_window=nms_window)
+                                  known_classes, nms_window=nms_window,
+                                  legend_box=_LEGEND_BOX)
 
         if state['converged']:
             print(f"  Converged (no l* found) at iteration {t}.")
@@ -1153,9 +1447,18 @@ def run_pipeline(plot_name, img_path, out_dir,
                         state['best_dist'], state['improved']))
 
         out_path = os.path.join(out_dir, f'iter{t:02d}.jpg')
-        build_iter_figure(t, P_current, S_current, state,
-                          I0, I0_rgb, L_refined, out_path)
+        _iter_img = build_iter_figure(t, P_current, S_current, state,
+                                      I0, I0_rgb, L_refined, out_path,
+                                      return_img=return_diag_imgs)
         iter_paths.append(out_path)
+        if return_diag_imgs and _iter_img is not None:
+            act_str = state['action']
+            diag_imgs.append({
+                'title': (f'Stage 5 — Iter {t}  [{act_str}]  '
+                          f'1-SSIM={state["best_dist"]:.4f}  '
+                          f'({"improved" if state["improved"] else "no improvement"})'),
+                'img_bgr': _iter_img,
+            })
 
         P_current = state['P_out']
         S_current = state['S_out']
@@ -1178,7 +1481,9 @@ def run_pipeline(plot_name, img_path, out_dir,
     for t_i, act, npts, dist, imp in history:
         print(f"  {t_i:>4}  {act:>10}  {npts:>6}  {dist:>10.5f}  {str(imp):>8}")
 
-    return history
+    if return_diag_imgs:
+        return history, diag_imgs, P_current, S_current
+    return history, P_current, S_current
 
 
 # ---------------------------------------------------------------------------
@@ -1187,7 +1492,7 @@ def run_pipeline(plot_name, img_path, out_dir,
 
 def run_correction(img_path, model_path, detector_py_path,
                    known_classes=None, out_dir=None, mode_xs=None,
-                   prep_info=None):
+                   prep_info=None, return_diag_imgs=False):
     """
     Convenience wrapper that runs the full pipeline on a single image.
 
@@ -1201,8 +1506,10 @@ def run_correction(img_path, model_path, detector_py_path,
     Returns
     -------
     dict with keys:
-        'history'  -- convergence history list
-        'out_dir'  -- path to the output directory
+        'history'    -- convergence history list
+        'out_dir'    -- path to the output directory
+        'P_current'  -- final corrected active point list (dicts with cx, cy, class_name, ...)
+        'S_current'  -- final suppressed point list
     """
     if known_classes is None:
         known_classes = KNOWN
@@ -1211,7 +1518,7 @@ def run_correction(img_path, model_path, detector_py_path,
                                os.path.splitext(os.path.basename(img_path))[0])
 
     plot_name = os.path.splitext(os.path.basename(img_path))[0]
-    history   = run_pipeline(
+    result = run_pipeline(
         plot_name        = plot_name,
         img_path         = img_path,
         out_dir          = out_dir,
@@ -1220,8 +1527,16 @@ def run_correction(img_path, model_path, detector_py_path,
         known_classes    = known_classes,
         mode_xs          = mode_xs,
         prep_info        = prep_info,
+        return_diag_imgs = return_diag_imgs,
     )
-    return {'history': history, 'out_dir': out_dir}
+    if return_diag_imgs:
+        history, diag_imgs, P_current, S_current = result
+        return {'history': history, 'out_dir': out_dir,
+                'diag_imgs': diag_imgs,
+                'P_current': P_current, 'S_current': S_current}
+    history, P_current, S_current = result
+    return {'history': history, 'out_dir': out_dir,
+            'P_current': P_current, 'S_current': S_current}
 
 
 # ---------------------------------------------------------------------------
