@@ -164,12 +164,17 @@
       <a id="downloadXlsx" href="#">Download data file (.xlsx)</a>
       <button id="openEditor" style="display:none; margin-top:12px; margin-left:8px; padding:10px 16px; background:var(--accent); color:#fff; border:none; border-radius:8px; cursor:pointer; font-size:14px;">Correct data points →</button>
       <button id="toggleDiag" style="display:none; margin-top:12px; margin-left:8px; padding:10px 16px; background:#fff; color:#333; border:1px solid var(--border); border-radius:8px; cursor:pointer; font-size:14px;">Show legend fit diagnostic</button>
+      <button id="toggleMasks" style="display:none; margin-top:12px; margin-left:8px; padding:10px 16px; background:#fff; color:#333; border:1px solid var(--border); border-radius:8px; cursor:pointer; font-size:14px;">Show colour masks</button>
       <button id="btnStep5" style="display:none; margin-top:12px; margin-left:8px; padding:10px 16px; background:#fff; color:var(--accent); border:1px solid var(--accent); border-radius:8px; cursor:pointer; font-size:14px;">Run Step 5 correction ↻</button>
       <div id="diagBox" style="display:none; margin-top:12px;">
         <div class="hint">Legend detection diagnostic — is the table fitted correctly? green = accepted colour swatch · cyan = accepted grey/black key · orange = rejected (near-neutral) · yellow = rejected (no text label beside it) · red = rejected (size/shape).</div>
         <img id="diagImg" alt="legend diagnostic" style="max-width:100%; border:1px solid var(--border); border-radius:8px;">
         <div class="hint" id="legendOverlayWrap" style="margin-top:8px;">Legend table mapped on the plot:</div>
         <img id="legendImg" alt="legend table overlay" style="max-width:100%; border:1px solid var(--border); border-radius:8px;">
+      </div>
+      <div id="masksBox" style="display:none; margin-top:12px;">
+        <div class="hint">Per-curve colour masks — each shows only the pixels assigned to that curve (white circles = detected data points). Use this to spot colour bleed between curves.</div>
+        <div id="masksGrid" class="masks"></div>
       </div>
     </div>
   </div>
@@ -506,6 +511,56 @@ async function runDigitize(withCorrect) {
     } else {
       toggleDiag.style.display = 'none';
       diagBox.style.display = 'none';
+    }
+    // Colour-mask gallery: fetch colormasks.json and show one card per curve.
+    const toggleMasks = document.getElementById('toggleMasks');
+    const masksBox = document.getElementById('masksBox');
+    const masksGrid = document.getElementById('masksGrid');
+    if (toggleMasks && (data.job_id || data.colormasks_url)) {
+      toggleMasks.style.display = 'inline-block';
+      masksBox.style.display = 'none';
+      toggleMasks.textContent = 'Show colour masks';
+      let masksLoaded = false;
+      toggleMasks.onclick = async () => {
+        const open = masksBox.style.display === 'none';
+        masksBox.style.display = open ? 'block' : 'none';
+        toggleMasks.textContent = open ? 'Hide colour masks' : 'Show colour masks';
+        if (open && !masksLoaded) {
+          const base = data.job_id ? ('/result/' + data.job_id + '/') : '';
+          const mUrl = data.colormasks_url || (base + 'colormasks.json');
+          try {
+            const res = await fetch(mUrl + '?t=' + Date.now());
+            const masks = await res.json();
+            masksGrid.innerHTML = '';
+            masks.forEach(m => {
+              const card = document.createElement('div');
+              card.className = 'maskcard';
+              const img = document.createElement('img');
+              img.src = base + m.file + '?t=' + Date.now();
+              img.alt = m.name;
+              const cap = document.createElement('div');
+              cap.className = 'cap';
+              const rgb = m.legend_rgb ? ('rgb(' + m.legend_rgb.join(',') + ')') : '#ccc';
+              const swatch = '<span style="display:inline-block;width:10px;height:10px;'
+                + 'border:1px solid #999;vertical-align:middle;margin-right:4px;'
+                + 'background:' + rgb + '"></span>';
+              cap.innerHTML = swatch + (m.label || m.name) + '<br>'
+                + m.mask_px + ' px · ' + m.points + ' pts';
+              card.appendChild(img);
+              card.appendChild(cap);
+              masksGrid.appendChild(card);
+            });
+            if (!masks.length) masksGrid.innerHTML = '<div class="hint">No colour masks in this run.</div>';
+          } catch (e) {
+            masksGrid.innerHTML = '<div class="hint">Could not load colour masks ('
+              + e.message + '). Re-run with the latest pipeline/server.</div>';
+          }
+          masksLoaded = true;
+        }
+      };
+    } else if (toggleMasks) {
+      toggleMasks.style.display = 'none';
+      masksBox.style.display = 'none';
     }
     // "Correct data points" button — always available after a run; the editor
     // opens on click. URLs fall back to job_id-based paths if the server didn't

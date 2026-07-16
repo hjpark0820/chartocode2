@@ -134,9 +134,13 @@ def _run_color(job_id, in_path, out_dir, plot_area, legend_box,
     if _truthy(x_log):     cmd += ["--x-log"]
     if _truthy(y_log):     cmd += ["--y-log"]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    _log = (proc.stdout or "") + (proc.stderr or "")
+    # Surface the pipeline's own stdout (incl. DEBUG_LABELS [labels] lines) to the
+    # server console. capture_output=True otherwise swallows it into the buffer, so
+    # nothing prints in the terminal even when DEBUG_LABELS=1 is set.
+    print(_log, flush=True)
     ok = (out_dir / "edit_data.json").exists()
-    return _response(job_id, out_dir, "color", ok,
-                     (proc.stdout or "") + (proc.stderr or ""))
+    return _response(job_id, out_dir, "color", ok, _log)
 
 
 # the 12 marker classes the B&W model knows (background excluded). When the user

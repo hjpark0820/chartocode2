@@ -1161,7 +1161,7 @@ def detect_has_errorbars(
         if 'segment_detector' in _sys.modules:
             _seg_mod = _sys.modules['segment_detector']
         else:
-            _seg_path = Path(__file__).parent / '3_segment_detection.py'
+            _seg_path = Path(__file__).parent / '3_segment_detection_v2.py'
             _spec = _ilu.spec_from_file_location('segment_detector', str(_seg_path))
             _seg_mod = _ilu.module_from_spec(_spec)
             _spec.loader.exec_module(_seg_mod)

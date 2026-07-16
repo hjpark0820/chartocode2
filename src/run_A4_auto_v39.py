@@ -64,7 +64,7 @@ v39: Legend/colour robustness + web-app diagnostics.
      - Walk NMS is now tied to the MARKER SIZE measured from the legend
        swatches (vertical ink extent at each legend cell, with the y-window
        capped to half the row spacing so it can't bleed into adjacent rows),
-       instead of a fixed 8px guess. NMS = 0.5x that marker diameter, so dense
+       instead of a fixed 8px guess. NMS = 1.0x that marker diameter, so dense
        markers on large plots aren't merged and sparse ones aren't split.
        (MARKER_DIAM env var still overrides.)
      - Default extraction mode = walk.
@@ -295,6 +295,36 @@ img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.int32)
 img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2Lab).astype(np.float32)
 H, W    = img.shape[:2]
 print(f"Image: {W}x{H}  ({IMG_PATH})")
+
+# --- Build signature: prints which features this file contains, so you can ----
+# confirm the RUNNING file is the version you edited (the server auto-picks the
+# highest run_A4_auto_v<N>.py, so a stale copy can silently win). Each flag is
+# detected from this file's own source, so it can't drift from the real code.
+try:
+    _self_src = open(os.path.abspath(__file__), 'r', encoding='utf-8', errors='ignore').read()
+    _feat = {
+        'legend-palette-swatch_rgb': "'swatch_rgb': _swatch_rgb" in _self_src,
+        'curve_rgb=swatch-first':    "_cd.get('swatch_rgb') or _cd.get('mean_rgb')" in _self_src,
+        'rgb_mean=median':           "np.median(img_rgb[raw]" in _self_src,
+        'uint8-overflow-fixed':      "abs(int(l[1]) - 128)" in _self_src,
+        'nearest-centroid-gate':     "(adk < 30) & (_nearest == k)" in _self_src,
+        'seed-pale-nearest-gate':    "(ad < 22) & (L > 130) & (ci == i)" in _self_src,
+        'achro-row-recovery':        "achro row recovery" in _self_src,
+        'pitch=span/steps':          "span/steps" in _self_src or "rows[-1] - rows[0]) / float(n)" in _self_src,
+        '2col-legend-blob':          "MULTI-COLUMN legend" in _self_src,
+        'hist-blob-escalation':      "2-D blob escalation" in _self_src,
+        'outlier-filter':            "_filter_line_outliers" in _self_src,
+        'mask-contam-diag':          "actual_median=%s" in _self_src,
+        'radius-diag':               "[radius] color%02d" in _self_src,
+    }
+    _on = [k for k, v in _feat.items() if v]
+    _off = [k for k, v in _feat.items() if not v]
+    print("BUILD SIGNATURE: run_A4_auto (color)  pipeline=" + os.path.basename(os.path.abspath(__file__)))
+    print("  features ON : " + (", ".join(_on) if _on else "(none)"))
+    if _off:
+        print("  features OFF: " + ", ".join(_off))
+except Exception as _se:
+    print("BUILD SIGNATURE: (could not self-inspect: %s)" % _se)
 
 # -- Background + axis detection ------------------------------------------------
 def _detect_dark_background():
@@ -1656,13 +1686,19 @@ def _build_unified_legend_grid(grid_cells, achro_swatches, align_tol=4, regulari
     filled_from_sample = False
     if regularize and len(rows) >= 3:
         gaps = sorted(rows[i + 1] - rows[i] for i in range(len(rows) - 1))
-        pitch = gaps[0]                                   # smallest gap = 1 row step
-        # guard against a spuriously tiny gap: use the smallest gap that is at
-        # least 60% of the median gap (rejects a merged double-detection).
         _med = gaps[len(gaps) // 2]
-        for g in gaps:
-            if g >= 0.6 * _med:
-                pitch = g; break
+        # Estimate the STEP count from the median gap (robust to a missing middle
+        # row, which shows up as one ~2x gap), then set pitch = span / steps. Using
+        # span/steps instead of the smallest gap avoids per-row drift: picking the
+        # smallest gap (e.g. 29 when the true pitch is 30.4) accumulates error down
+        # the column (11px by the last row here) and, because the smallest gap
+        # depends on 1-2px detection noise, made the result flip between runs
+        # (sometimes aligned, sometimes not). span/steps is stable and centred.
+        pitch = _med
+        if _med >= 6:
+            n = int(round((rows[-1] - rows[0]) / _med))
+            if 0 < n <= 40:
+                pitch = (rows[-1] - rows[0]) / float(n)
         if pitch >= 6:
             n = int(round((rows[-1] - rows[0]) / pitch))
             if 0 < n <= 40:
@@ -2729,7 +2765,7 @@ def _discover_colors():
                 claimed |= raw
                 raw_mask = raw.astype(np.uint8)
                 px_count = int(raw_mask.sum())
-                rgb_mean = (tuple(img_rgb[raw].mean(axis=0).astype(int))
+                rgb_mean = (tuple(np.median(img_rgb[raw], axis=0).astype(int))
                             if px_count > 0 else (128, 128, 128))
                 clean_mask = _clean_mask_advanced(raw_mask, is_achromatic=_is_achromatic(lab), mask_lab=lab)
                 cd = {
@@ -2865,6 +2901,62 @@ def _discover_colors():
                 (round(c[0]), round(c[1]), tuple(int(z) for z in c[2])) for c in _achro_sw]
             print(f"  Legend panel (user-box marker fallback): {len(mk)} swatches "
                   f"({len(_chrom_cells)} chromatic + {len(_achro_sw)} achromatic)")
+
+    # 2-D chromatic-blob escalation before giving up to the hue histogram. The
+    # single-column / unified detectors can miss a swatch in a 2-COLUMN legend
+    # (e.g. purple in column 2), leaving palette_lab short -> the hue-histogram
+    # fallback then re-derives colours from the WHOLE plot and invents spurious
+    # greys. A plain 2-D connected-component pass over the legend box reads
+    # multi-column colour swatches cleanly, so we keep the real legend palette and
+    # never reach the histogram. Only fires when we were about to fall back AND a
+    # user box is given AND it finds >= the minimum, so it can't cause regressions.
+    if len(palette_lab) < LEGEND_MIN_ENTRIES and USER_LEGEND_BOX is not None:
+        _bx0, _by0, _bx1, _by1 = [int(v) for v in USER_LEGEND_BOX]
+        _lp = img_rgb[_by0:_by1, _bx0:_bx1]
+        if _lp.size > 0:
+            _lhsv = cv2.cvtColor(_lp, cv2.COLOR_RGB2HSV)
+            _cm = ((_lhsv[:, :, 1] > 80) & (_lhsv[:, :, 2] > 60)).astype(np.uint8)
+            _nc, _ll, _stt, _cc = cv2.connectedComponentsWithStats(_cm, 8)
+            _cols = []
+            for _k in range(1, _nc):
+                if _stt[_k, cv2.CC_STAT_AREA] < 6 or _stt[_k, cv2.CC_STAT_WIDTH] > 60:
+                    continue
+                _yy, _xx = np.where(_ll == _k)
+                _md = np.median(_lp[_yy, _xx].reshape(-1, 3), axis=0)
+                _cols.append((int(_cc[_k][0]) + _bx0, int(_cc[_k][1]) + _by0,
+                              (int(_md[0]), int(_md[1]), int(_md[2]))))
+            _uniq = []
+            for (cx, cy, rgb) in _cols:
+                if all(abs(rgb[0]-u[2][0]) + abs(rgb[1]-u[2][1]) + abs(rgb[2]-u[2][2]) > 40
+                       for u in _uniq):
+                    _uniq.append((cx, cy, rgb))
+            if len(_uniq) >= LEGEND_MIN_ENTRIES:
+                hp = []
+                for (cx, cy, rgb) in _uniq:
+                    lab = cv2.cvtColor(np.array([[list(rgb)]], np.uint8),
+                                       cv2.COLOR_RGB2Lab)[0, 0].astype(np.float32)
+                    hp.append(lab)
+                palette_lab = hp
+                horiz_palette = hp
+                legend_box = USER_LEGEND_BOX
+                globals()['_LEGEND_BOX_FOR_CLEAN'] = legend_box
+                globals()['_LEGEND_SWATCH_INFO'] = [{'lab': p} for p in hp]
+                def _cl1d_esc(vals, tol):
+                    if not vals:
+                        return []
+                    vs = sorted(vals); g = [[vs[0]]]
+                    for x in vs[1:]:
+                        (g[-1].append(x) if x - g[-1][-1] <= tol else g.append([x]))
+                    return [float(np.mean(z)) for z in g]
+                _gx = _cl1d_esc([c[0] for c in _uniq], 18)
+                _gy = _cl1d_esc([c[1] for c in _uniq], 7)
+                globals()['_LAST_LEGEND_GRID'] = {
+                    'cols': [round(c) for c in _gx], 'rows': [round(r) for r in _gy],
+                    'cells': [(round(c[0]), round(c[1]), tuple(int(z) for z in c[2]))
+                              for c in _uniq]}
+                globals()['_LAST_ACHRO_SWATCHES'] = []
+                print(f"  Legend panel (2-D blob escalation): {len(_uniq)} colours "
+                      f"-> skipping hue-histogram fallback")
 
     if len(palette_lab) < LEGEND_MIN_ENTRIES:
         print("  Fallback: hue-histogram colour discovery")
@@ -3023,6 +3115,13 @@ def _discover_colors():
         max_dists = _verify_and_refine_with_legend(palette_lab, max_dists)
         s_mins    = _saturation_floors(palette_lab)
         prio_bias = _confusable_priority(palette_lab)
+        if os.environ.get('DEBUG_MASKS'):
+            for k, lab in enumerate(palette_lab):
+                _rgbk = tuple(int(v) for v in cv2.cvtColor(
+                    np.uint8([[np.clip(lab, 0, 255)]]), cv2.COLOR_Lab2RGB)[0, 0])
+                print("    [radius] color%02d rgb=%s  radius=%.0f  S_floor=%.0f  bias=%.1f"
+                      % (k+2, _rgbk, max_dists[k], s_mins[k],
+                         (prio_bias[k] if prio_bias is not None else 0)), flush=True)
         for k, sm in enumerate(s_mins):
             if sm >= 0:
                 print(f"    sat-floor: color{k+2:02d} S>={sm:.0f}")
@@ -3044,10 +3143,13 @@ def _discover_colors():
             raw = raw & PLOT_MASK
             raw_mask   = raw.astype(np.uint8)
             px_count   = int(raw_mask.sum())
-            rgb_mean   = (tuple(img_rgb[raw].mean(axis=0).astype(int))
+            rgb_mean   = (tuple(np.median(img_rgb[raw], axis=0).astype(int))
                           if px_count > 0 else (128, 128, 128))
             clean_mask = _clean_mask_advanced(raw_mask, is_achromatic=_is_achromatic(lab), mask_lab=lab)
-            colors.append({'name': name, 'mean_rgb': rgb_mean, 'px_count': px_count,
+            _swatch_rgb = tuple(int(v) for v in cv2.cvtColor(
+                np.uint8([[np.clip(lab, 0, 255)]]), cv2.COLOR_Lab2RGB)[0, 0])
+            colors.append({'name': name, 'mean_rgb': rgb_mean, 'swatch_rgb': _swatch_rgb,
+                           'px_count': px_count,
                            '_raw_mask': raw, '_clean_mask': clean_mask})
             tag = 'achrom' if _is_achromatic(lab) else 'chrom'
             print(f"    {name}: raw={px_count}px  clean={clean_mask.sum()}px  RGB={rgb_mean}  [nearest-centroid,{tag}]")
@@ -3091,10 +3193,13 @@ def _discover_colors():
         claimed |= raw
         raw_mask   = raw.astype(np.uint8)
         px_count   = int(raw_mask.sum())
-        rgb_mean   = (tuple(img_rgb[raw].mean(axis=0).astype(int))
+        rgb_mean   = (tuple(np.median(img_rgb[raw], axis=0).astype(int))
                       if px_count > 0 else (128, 128, 128))
         clean_mask = _clean_mask_advanced(raw_mask, is_achromatic=_is_achromatic(lab), mask_lab=lab)
-        colors.append({'name': name, 'mean_rgb': rgb_mean, 'px_count': px_count,
+        _swatch_rgb = tuple(int(v) for v in cv2.cvtColor(
+            np.uint8([[np.clip(lab, 0, 255)]]), cv2.COLOR_Lab2RGB)[0, 0])
+        colors.append({'name': name, 'mean_rgb': rgb_mean, 'swatch_rgb': _swatch_rgb,
+                       'px_count': px_count,
                        '_raw_mask': raw, '_clean_mask': clean_mask})
         tag = ' [achro]' if i in achro_masks else ''
         print(f"    {name}: raw={px_count}px  clean={clean_mask.sum()}px  RGB={rgb_mean}{tag}")
@@ -4298,7 +4403,7 @@ class PlotDigitizer:
         clean. The sink is flagged in `self.is_sink` and is NOT a data curve."""
         pal = [tuple(int(c) for c in rgb) for rgb in rgb_list]
         lab = [cv2.cvtColor(np.uint8([[c]]), cv2.COLOR_RGB2Lab)[0, 0] for c in pal]
-        is_ach = [abs(l[1] - 128) < 8 and abs(l[2] - 128) < 8 for l in lab]
+        is_ach = [abs(int(l[1]) - 128) < 8 and abs(int(l[2]) - 128) < 8 for l in lab]
 
         added_black = False
         if add_black_if_missing and not any(is_ach):
@@ -4490,7 +4595,11 @@ class PlotDigitizer:
             for i, k in enumerate(self.chrom_idx):
                 ad = np.abs((ang - self.pal_ang[k] + 180) % 360 - 180)
                 strong = (mind <= 32) & (chroma >= 15) & (ci == i)
-                pale = (chroma >= 6) & (ad < 22) & (L > 130)  # pale but clearly hued
+                # 'pale' also requires k to be the NEAREST chromatic centroid
+                # (ci == i); otherwise a bright pale edge of a hue-adjacent colour
+                # (e.g. magenta, 14 deg from blue) could seed the wrong curve and
+                # region-growing would then amplify that bad seed.
+                pale = (chroma >= 6) & (ad < 22) & (L > 130) & (ci == i)
                 sel = strong | pale
                 assign[ys[sel], xs[sel]] = k
         else:
@@ -4532,7 +4641,18 @@ class PlotDigitizer:
                     score = pchr
                 else:
                     adk = np.abs((pang - self.pal_ang[k] + 180) % 360 - 180)
-                    valid = (pchr >= 3) & (adk < 30)
+                    # Require k to also be the pixel's NEAREST palette colour in
+                    # full Lab. Hue-angle alone can't separate colours that share a
+                    # hue but differ in chroma/lightness (deep blue vs magenta are
+                    # only 14 deg apart here), so one region absorbed the other.
+                    # The full-Lab nearest-centroid gate stops that cross-theft: a
+                    # magenta pixel's nearest centroid is magenta, so blue can no
+                    # longer claim it during region growing.
+                    _plab = self.lab[fy, fx, :]                          # (M,3)
+                    _dall = np.linalg.norm(
+                        _plab[:, None, :] - self.pal_lab[None, :, :], axis=2)  # (M,K)
+                    _nearest = _dall.argmin(axis=1)
+                    valid = (pchr >= 3) & (adk < 30) & (_nearest == k)
                     score = adk
                 iv = np.where(valid)[0]
                 better = score[iv] < best_s[fy[iv], fx[iv]]
@@ -5176,7 +5296,7 @@ class PlotDigitizer:
         walk (seed_walk_nodes), then take data points as (a) the path's TURNING
         POINTS -- local y-extrema, so a vertical re-dose jump yields BOTH its
         bottom (trough) and top (peak) -- plus (b) density peaks along the path
-        for markers on flat/sloped parts. Peaks closer than nms_px (= 0.5x the
+        for markers on flat/sloped parts. Peaks closer than nms_px (= 1.0x the
         marker diameter) are merged. Populates self.walk_points = {k:[(x,y)...]}.
         Chromatic curves only; achromatic keeps the continuity extractor."""
         if R is None:
@@ -5485,6 +5605,52 @@ for _ac in _ach_from_legend:
     _names.append('black' if (sum(_ac) / 3.0) < 90 else 'grey')
 if _ach_from_legend:
     print(f"  [legend achromatic swatches: {_ach_from_legend}]")
+# Safety net for a MISSING ACHROMATIC ROW (e.g. a black filled-circle swatch in a
+# column of colour swatches): the chromatic-only row scan can leave a gap, so the
+# unified table comes out one row short. Detect dark compact swatches in the swatch
+# COLUMN at row positions the chromatic grid didn't cover, and add them to
+# _LAST_ACHRO_SWATCHES so the table gets the full row count. Purely additive.
+try:
+    if _grid_now and _grid_now.get('cells') and _lb is not None:
+        _cells = _grid_now['cells']
+        _sw_xs = [int(c[0]) for c in _cells]
+        _sw_ys = [int(c[1]) for c in _cells]
+        _col_x = int(np.median(_sw_xs))
+        _known = set(_sw_ys) | {p[1] for p in globals().get('_LAST_ACHRO_SWATCHES', [])}
+        _lbx0, _lby0, _lbx1, _lby1 = [int(v) for v in _lb]
+        _cx0 = max(0, _col_x - 16); _cx1 = min(W, _col_x + 17)
+        _colimg = img_rgb[_lby0:_lby1, _cx0:_cx1]
+        if _colimg.size > 0:
+            _cg = cv2.cvtColor(_colimg, cv2.COLOR_RGB2GRAY)
+            _dk = (_cg < 110).astype(np.uint8)
+            _dn, _dl2, _dst, _dct = cv2.connectedComponentsWithStats(_dk, 8)
+            _added = []
+            for _q in range(1, _dn):
+                _qa = _dst[_q, cv2.CC_STAT_AREA]; _qw = _dst[_q, cv2.CC_STAT_WIDTH]
+                _qh = _dst[_q, cv2.CC_STAT_HEIGHT]
+                if _qa < 20 or _qw > 34 or _qh > 22:
+                    continue
+                _qy = int(_dct[_q][1]) + _lby0
+                _qx = int(_dct[_q][0]) + _cx0
+                if any(abs(_qy - ky) <= 8 for ky in _known):
+                    continue
+                _pix = _colimg[_dl2 == _q]
+                _Ls = _pix.sum(axis=1)
+                _core = _pix[_Ls <= np.percentile(_Ls, 30)]
+                _dc = (np.mean(_core, axis=0) if len(_core) >= 3
+                       else np.median(_pix, axis=0)).astype(int)
+                if int(max(_dc)) - int(min(_dc)) > 40:
+                    continue
+                _added.append((_qx, _qy, (int(_dc[0]), int(_dc[1]), int(_dc[2]))))
+                _known.add(_qy)
+            if _added:
+                _cur = list(globals().get('_LAST_ACHRO_SWATCHES', []))
+                globals()['_LAST_ACHRO_SWATCHES'] = _cur + _added
+                print(f"  [achro row recovery: +{len(_added)} dark swatch(es) "
+                      f"at y={[a[1] for a in _added]}]")
+except Exception as _are:
+    print(f"  [achro row recovery skipped: {_are}]")
+
 # unified STRICT table: chromatic + achromatic swatches snapped to (col,row)
 # intersections, empty cells kept as empty, column/row alignment verified.
 _unified = _build_unified_legend_grid(
@@ -5662,7 +5828,7 @@ except Exception as _e:
     print(f"  [stem/cap overlay skipped: {_e}]")
 _dig.extract_data_points()
 # Optional alternative extractor (per-colour curve walk: turning points + density
-# peaks, NMS = 0.5x marker diameter). Enable with EXTRACT_MODE=walk.
+# peaks, NMS = 1.0x marker diameter). Enable with EXTRACT_MODE=walk.
 _EXTRACT_MODE = os.environ.get('EXTRACT_MODE', 'walk')
 if _EXTRACT_MODE == 'walk':
     # Marker diameter, measured from the LEGEND swatches: at each legend cell
@@ -5712,12 +5878,12 @@ if _EXTRACT_MODE == 'walk':
     else:
         _measured = _measure_marker_height()
         _mdiam = _measured if (_measured and _measured >= 3) else 8
-    _nms = max(1, round(_mdiam * 0.5))
+    _nms = max(1, round(_mdiam * 1.0))
     _dig.extract_curve_walk(nms_px=_nms)
     _src_tag = ("measured from legend swatches" if _measured
                 else ("env override" if 'MARKER_DIAM' in os.environ else "default"))
     print(f"  [extract mode = WALK | marker diam = {_mdiam}px ({_src_tag}) "
-          f"| NMS = {_nms}px (0.5x marker diam)]")
+          f"| NMS = {_nms}px (1.0x marker diam)]")
 
 # --- emit v24-format structures ---------------------------------------------
 all_detections = {}
@@ -5790,6 +5956,165 @@ for cd in COLORS:
     _k = _names.index(cd['name'])
     cd['_raw_mask_canvas'] = (_dig.assign == _k).astype(np.uint8) * 255
     cd['_clean_mask'] = (_dig.assign == _k)
+
+# --- Line-continuity outlier filter (borrowed idea from the B&W Stage-4 -------
+# correction): a real curve is a smooth y = f(x), so a detected point that sits
+# far off the LOCAL line through its x-neighbours is almost always foreign --
+# an error-bar cap, or another curve's marker pulled in by colour bleed. We drop
+# only clear, large deviations (a local LINEAR fit absorbs genuine steep slopes,
+# so real points on steep log-axis segments are kept), never below min_keep pts.
+# Opt-out with NO_OUTLIER_FILTER=1.
+def _filter_line_outliers(pts, min_keep=4, dev_mult=4.0, min_dev_px=18.0):
+    if len(pts) <= min_keep:
+        return pts, 0
+    P = sorted(pts, key=lambda d: d['x'])
+    xs = np.array([p['x'] for p in P], float)
+    ys = np.array([p['y'] for p in P], float)
+    n = len(P)
+    resid = np.full(n, np.nan)                     # NaN = endpoint, judged leniently
+    for i in range(n):
+        left  = [j for j in range(n) if xs[j] < xs[i]]
+        right = [j for j in range(n) if xs[j] > xs[i]]
+        if not left or not right:
+            continue                               # endpoint: keep (no both-side context)
+        # up to 3 nearest neighbours on EACH side -> balanced local trend that
+        # follows curvature, so genuine steep/curved segments are not flagged.
+        nb = sorted(left, key=lambda j: xs[i]-xs[j])[:3] + \
+             sorted(right, key=lambda j: xs[j]-xs[i])[:3]
+        nx = xs[nb]; ny = ys[nb]
+        if len(nb) >= 3 and np.ptp(nx) > 1e-6:
+            a, b = np.polyfit(nx, ny, 1)
+            pred = a * xs[i] + b
+        else:
+            pred = np.median(ny)
+        resid[i] = abs(ys[i] - pred)
+    valid = ~np.isnan(resid)
+    if valid.sum() == 0:
+        return P, 0
+    med = float(np.median(resid[valid]))
+    mad = float(np.median(np.abs(resid[valid] - med))) + 1e-6
+    thresh = max(min_dev_px, med + dev_mult * mad)
+    keep = np.ones(n, bool)
+    keep[valid] = resid[valid] <= thresh           # endpoints (NaN) always kept
+    if int(keep.sum()) < min_keep:
+        idx = np.argsort(np.nan_to_num(resid, nan=-1))[:min_keep]
+        keep = np.zeros(n, bool); keep[idx] = True
+    dropped = int((~keep).sum())
+    return [P[i] for i in range(n) if keep[i]], dropped
+
+if not os.environ.get('NO_OUTLIER_FILTER'):
+    _tot_drop = 0
+    for _cn in list(all_detections.keys()):
+        _filtered, _nd = _filter_line_outliers(all_detections[_cn])
+        if _nd > 0:
+            all_detections[_cn] = _filtered
+            _tot_drop += _nd
+            print(f"  [outlier filter] {_cn}: dropped {_nd} off-curve point(s)")
+
+    # --- B&W-style FAKE-SEGMENT filter -------------------------------------
+    # Borrowed from the B&W Stage-4 rule: a connecting line between two data
+    # points must actually EXIST in the plot. Here (colour mode = option A) we
+    # verify it against THIS curve's own colour pixels: sample the segment
+    # between adjacent points and measure the fraction that lands on the curve's
+    # ink. A genuine segment follows the coloured curve (~1.0); a zigzag that
+    # crosses empty background scores ~0. If BOTH segments at an interior point
+    # are fake, that point is disconnected from its curve -> an outlier. This
+    # catches self-consistent contamination that the geometric filter above
+    # cannot (its neighbours form a smooth-looking but non-existent line).
+    def _curve_ink_mask(_cn):
+        # Option A: use pixels whose ACTUAL colour matches this curve's legend
+        # swatch -- NOT the digitizer's assign map, which is contaminated in the
+        # dense overlap (e.g. the orange mask absorbed magenta/green), which would
+        # let a fake orange zig-zag pass over those foreign pixels. Matching the
+        # true swatch colour means a fake segment crossing non-orange pixels scores
+        # ~0 and is correctly flagged.
+        _sw = None
+        try:
+            for _cd in COLORS:
+                if _cd.get('name') == _cn:
+                    _sw = _cd.get('swatch_rgb') or _cd.get('mean_rgb'); break
+        except NameError:
+            _sw = None
+        if _sw is None:
+            return None
+        _swr = np.array([int(_sw[0]), int(_sw[1]), int(_sw[2])], np.int32)
+        # adaptive tolerance: keep it generous for an isolated colour (orange), but
+        # shrink to half the gap to the NEAREST other swatch so a confusable pair
+        # (e.g. the two purple/blue SC curves, ~44 apart) doesn't include each
+        # other's pixels and fool the segment check.
+        _tol = 70.0
+        try:
+            for _cd in COLORS:
+                _os = _cd.get('swatch_rgb') or _cd.get('mean_rgb')
+                if _cd.get('name') == _cn or _os is None:
+                    continue
+                _dd = float(np.linalg.norm(_swr - np.array(_os, np.int32)))
+                _tol = min(_tol, max(40.0, _dd * 0.5))
+        except NameError:
+            pass
+        _d = np.linalg.norm(img_rgb.astype(np.int32) - _swr[None, None, :], axis=2)
+        _m = (_d < _tol).astype(np.uint8)               # pixels close to swatch colour
+        # restrict to the plot area (drop legend / axis text of the same colour)
+        try:
+            _px0, _py0, _px1, _py1 = [int(v) for v in PLOT_AREA]
+            _band = np.zeros_like(_m); _band[_py0:_py1, _px0:_px1] = 1
+            _m = _m & _band
+        except (NameError, TypeError):
+            pass
+        if _m.sum() == 0:
+            return None
+        # dilate so thin / anti-aliased / dashed coloured lines still register
+        return cv2.dilate(_m, np.ones((3, 3), np.uint8), iterations=3).astype(bool)
+
+    def _seg_on_curve(p0, p1, ink):
+        # Sample along the segment, but check a small PERPENDICULAR neighbourhood
+        # at each sample (the connecting line is a few px thick and may wander),
+        # and score the fraction of samples that see curve ink nearby. This keeps
+        # genuine long / faded / dashed segments valid while a segment crossing
+        # empty background still scores ~0.
+        _n = max(2, int(np.hypot(p1[0] - p0[0], p1[1] - p0[1])) // 2)
+        _xs = np.clip(np.linspace(p0[0], p1[0], _n).astype(int), 0, W - 1)
+        _ys = np.clip(np.linspace(p0[1], p1[1], _n).astype(int), 0, H - 1)
+        return float(ink[_ys, _xs].mean())
+
+    def _filter_fake_segments(pts, ink, seg_thresh=0.12, min_keep=4, max_iter=3):
+        # Conservative: only a point whose BOTH adjoining segments are almost
+        # entirely off the curve's colour (< seg_thresh) is dropped, and at most
+        # max_iter of them, so real points are protected. Removed points are
+        # logged with their segment scores so over-removal is easy to spot.
+        if ink is None or len(pts) <= min_keep:
+            return pts, []
+        P = sorted(pts, key=lambda d: d['x'])
+        dropped = []
+        for _ in range(max_iter):
+            n = len(P)
+            if n <= min_keep:
+                break
+            xy = [(p['x'], p['y']) for p in P]
+            svals = [_seg_on_curve(xy[i], xy[i + 1], ink) for i in range(n - 1)]
+            worst = -1; worst_sum = 2.0
+            for i in range(1, n - 1):
+                if svals[i - 1] < seg_thresh and svals[i] < seg_thresh:
+                    s = svals[i - 1] + svals[i]
+                    if s < worst_sum:
+                        worst_sum = s; worst = i
+            if worst < 0:
+                break
+            dropped.append((xy[worst], round(svals[worst - 1], 2), round(svals[worst], 2)))
+            del P[worst]
+        return P, dropped
+
+    for _cn in list(all_detections.keys()):
+        _ink = _curve_ink_mask(_cn)
+        _filtered, _drp = _filter_fake_segments(all_detections[_cn], _ink)
+        if _drp:
+            all_detections[_cn] = _filtered
+            _tot_drop += len(_drp)
+            _det = ", ".join(f"({p[0]},{p[1]}) segs={l}/{r}" for (p, l, r) in _drp)
+            print(f"  [fake-segment filter] {_cn}: dropped {len(_drp)} -> {_det}")
+
+    if _tot_drop == 0:
+        print("  [outlier filter] no off-curve points found")
 
 # Post-filter: remove colours with 0 detections
 all_detections_out = {k: v for k, v in all_detections.items() if len(v) > 0}
@@ -5888,7 +6213,27 @@ if PLOT_AREA is not None and _has_manual:
 
 # median colour per curve (sampled at its own points) -> identifies the curve
 _curve_rgb = {}
+# Prefer the LEGEND-LOCKED palette colour (COLORS' mean_rgb) for each curve. The
+# old approach sampled a 5x5 patch around every detected point and took the median,
+# but low-dose curves sit in the dense day-0 overlap where those patches are full of
+# NEIGHBOURING curves' pixels, so even the median washed out (vivid blue -> pink).
+# The palette colour is the ground truth the labels were matched against (dist 0),
+# so use it; only fall back to point-sampling for a curve with no palette entry.
+_pal_map = {}
+try:
+    for _cd in COLORS:
+        _nm = _cd.get('name')
+        # pure legend swatch colour first (zero contamination); then the median
+        # mask colour; the point-sampling below is only a last resort.
+        _mr = _cd.get('swatch_rgb') or _cd.get('mean_rgb')
+        if _nm is not None and _mr is not None and len(_mr) == 3:
+            _pal_map[_nm] = (int(_mr[0]), int(_mr[1]), int(_mr[2]))
+except Exception:
+    _pal_map = {}
 for _cname, _pts in all_detections_out.items():
+    if _cname in _pal_map:
+        _curve_rgb[_cname] = _pal_map[_cname]
+        continue
     _samp = []
     for _p in _pts:
         _x, _y = int(_p['x']), int(_p['y'])
@@ -5909,27 +6254,319 @@ def _hex(rgb):
 # legend just to the RIGHT of its swatch to get the printed label. Falls back to
 # the colorNN id when no legend text is available or OCR is empty.
 def _curve_labels():
+    _DBG = os.environ.get('DEBUG_LABELS')
+    def _dl(*a):
+        if _DBG: print("  [labels]", *a)
     labels = {_c: _c for _c in all_detections_out.keys()}   # default colorNN
     if not _HAS_OCR:
+        _dl("OCR OFF (pytesseract import failed) -> labels stay colour names")
         return labels
     # Prefer the user-drawn legend box; else the detected one.
     lb = USER_LEGEND_BOX if USER_LEGEND_BOX is not None else \
          globals().get('_LEGEND_BOX_FOR_CLEAN', None)
+    _dl("legend box =", lb, "(source:",
+        "user-drawn" if USER_LEGEND_BOX is not None else
+        ("auto-detected" if lb is not None else "NONE"), ")")
     if lb is None:
+        _dl("NO legend box -> cannot OCR labels -> colour names used")
         return labels
     lx0, ly0, lx1, ly1 = [int(v) for v in lb]
     lx0 = max(0, min(lx0, W - 1)); lx1 = max(0, min(lx1, W))
     ly0 = max(0, min(ly0, H - 1)); ly1 = max(0, min(ly1, H))
     if lx1 - lx0 < 8 or ly1 - ly0 < 6:
+        _dl("legend box too small", (lx1-lx0, ly1-ly0), "-> colour names used")
         return labels
     panel = img[ly0:ly1, lx0:lx1]
 
+    curve_names = list(all_detections_out.keys())
+    curve_rgbs = {c: _curve_rgb[c] for c in curve_names}
+    _pal_by_name = {}
+    try:
+        for _cd in COLORS:
+            _nm = _cd.get('name'); _mr = _cd.get('mean_rgb')
+            if _nm is not None and _mr is not None and len(_mr) == 3:
+                _pal_by_name[_nm] = (int(_mr[0]), int(_mr[1]), int(_mr[2]))
+    except Exception:
+        _pal_by_name = {}
+    match_rgbs = {c: _pal_by_name.get(c, curve_rgbs[c]) for c in curve_names}
+
+    def _ocr_strip(gray_strip):
+        if gray_strip is None or gray_strip.size == 0 or gray_strip.shape[1] < 4:
+            return ''
+        sg = cv2.resize(gray_strip, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+        # Otsu handles the small low-contrast legend font better than a fixed 150.
+        _, sg = cv2.threshold(sg, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # white padding so glyphs at the edges aren't clipped by the OCR engine
+        sg = cv2.copyMakeBorder(sg, 12, 12, 16, 16, cv2.BORDER_CONSTANT, value=255)
+        # whitelist relevant glyphs (no 'l': it made "mg/kg"->"malka")
+        _wl = ('-c tessedit_char_whitelist='
+               '0123456789.,/%()xX+-mgkQWNbBwacetohnpsurID= ')
+        best = ''
+        for _psm in (7, 6):
+            try:
+                t = pytesseract.image_to_string(sg, config='--psm %d %s' % (_psm, _wl))
+                t = ' '.join(t.split())
+            except Exception as _oe:
+                _dl("OCR error:", _oe); t = ''
+            # prefer the reading that contains a digit and is longer (more complete)
+            score = len(t) + (5 if any(ch.isdigit() for ch in t) else 0)
+            if score > len(best) + (5 if any(ch.isdigit() for ch in best) else 0):
+                best = t
+        return _fix_label_text(best)
+
+    def _fix_label_text(t):
+        # Domain-specific cleanup for PK/PD dose legends. tesseract reliably reads
+        # this small font's "g" as "a" and "8" as "B", and a coloured marker tail
+        # just left of the text can add a leading "-". These labels follow the
+        # "<dose> mg/kg <Q#W>" pattern (or "Placebo"), so we repair the known
+        # confusions with anchored substitutions (safe, not global).
+        import re
+        if not t:
+            return t
+        # 1) strip leading marker-tail noise: a label never starts with -,.,/ etc.
+        t = re.sub(r'^[\s\-\u2013\u2014.,/|=]+', '', t)
+        s = ' ' + t + ' '
+        # 2) unit: ma/ka, mg/ka, ma/kg, and slash-less maka/mgka/makg -> mg/kg
+        s = re.sub(r'm[ag]\s*/\s*k[ag]', 'mg/kg', s, flags=re.I)
+        s = re.sub(r'm[ag]\s*k[ag]', 'mg/kg', s, flags=re.I)
+        # 3) dosing code: QBW/Q3W-ish OCR of Q8W; keep Q4W as-is
+        s = re.sub(r'Q\s*B\s*W', 'Q8W', s, flags=re.I)
+        s = re.sub(r'Q\s*([48])\s*W', lambda m: 'Q%sW' % m.group(1), s, flags=re.I)
+        # 4) restore "Placebo" when the leading P/Pl was clipped by the swatch
+        s = re.sub(r'\b[Pp]?l?acebo\b', 'Placebo', s)
+        # 5) put a space between dose number and unit if OCR ran them together
+        s = re.sub(r'(\d(?:\.\d)?)(mg/kg)', r'\1 \2', s, flags=re.I)
+        s = re.sub(r'(mg/kg)(Q\d W?)', r'\1 \2', s, flags=re.I)
+        s = re.sub(r'(mg/kg)(Q\dW)', r'\1 \2', s, flags=re.I)
+        return ' '.join(s.split())
+
+    def _assign(cost):
+        try:
+            from scipy.optimize import linear_sum_assignment
+            ri, ci = linear_sum_assignment(cost)
+            return list(zip(ri.tolist(), ci.tolist()))
+        except Exception as _ae:
+            _dl("Hungarian unavailable (%s) -> greedy" % _ae)
+            return [(i, int(np.argmin(cost[i]))) for i in range(cost.shape[0])]
+
+    # ===== MULTI-COLUMN legend (runs regardless of grid detection) ==============
+    # A 2-column legend (e.g. Cohort 6 | Cohort 7 on one row) breaks single-column
+    # row logic: both columns' text lands in one band. Detect the coloured swatch
+    # blobs in 2-D; if they form >=2 columns, OCR each label bounded on the right
+    # by the NEXT swatch in that row. This must run even when the legend GRID
+    # detection failed (hue-histogram fallback), which is exactly when 2-column
+    # legends show up, so it is placed before the grid path below.
+    try:
+        _p_hsv = cv2.cvtColor(panel, cv2.COLOR_BGR2HSV)
+        _chrom = ((_p_hsv[:, :, 1] > 80) & (_p_hsv[:, :, 2] > 60)).astype(np.uint8)
+        _ncc, _lbl, _stats, _cents = cv2.connectedComponentsWithStats(_chrom, 8)
+        _blobs = []
+        for _k in range(1, _ncc):
+            _a = int(_stats[_k, cv2.CC_STAT_AREA]); _w = int(_stats[_k, cv2.CC_STAT_WIDTH])
+            if _a < 6 or _w > 60:
+                continue
+            _x = int(_stats[_k, cv2.CC_STAT_LEFT])
+            _cx = int(_cents[_k][0]); _cy = int(_cents[_k][1])
+            _ys, _xs = np.where(_lbl == _k)
+            _med = np.median(panel[_ys, _xs].reshape(-1, 3), axis=0)
+            _blobs.append({'cx': _cx, 'cy': _cy, 'x0': _x, 'x1': _x + _w,
+                           'rgb': (int(_med[2]), int(_med[1]), int(_med[0]))})
+        _colx = []
+        for _b in sorted(_blobs, key=lambda b: b['cx']):
+            if not _colx or _b['cx'] - _colx[-1] > 40:
+                _colx.append(_b['cx'])
+        if len(_colx) >= 2 and len(_blobs) >= 2:
+            _bys = sorted(set(b['cy'] for b in _blobs))
+            _rp = min((_bys[k+1]-_bys[k] for k in range(len(_bys)-1)
+                       if _bys[k+1]-_bys[k] > 4), default=16)
+            _dl("MULTI-COLUMN legend: %d cols, %d swatches, pitch~%d"
+                % (len(_colx), len(_blobs), _rp))
+            cost = np.zeros((len(_blobs), len(curve_names)), dtype=float)
+            for i, b in enumerate(_blobs):
+                for j, c in enumerate(curve_names):
+                    pr, pg, pb = match_rgbs[c]
+                    cost[i, j] = (pr-b['rgb'][0])**2 + (pg-b['rgb'][1])**2 + (pb-b['rgb'][2])**2
+            for i, j in _assign(cost):
+                b = _blobs[i]; c = curve_names[j]; d = cost[i, j] ** 0.5
+                if d > 200:
+                    _dl("blob cx=%d cy=%d rgb=%s -> %s REJECTED (dist %.0f)"
+                        % (b['cx'], b['cy'], b['rgb'], c, d)); continue
+                same = [o for o in _blobs
+                        if abs(o['cy']-b['cy']) < max(6, _rp*0.6) and o['x0'] > b['x1']]
+                rbound = (min(o['x0'] for o in same) - 2) if same else panel.shape[1]
+                yb0 = max(0, b['cy'] - int(_rp*0.55))
+                yb1 = min(panel.shape[0], b['cy'] + int(_rp*0.55))
+                tx0 = min(rbound, b['x1'] + 3)
+                sub = (cv2.cvtColor(panel[yb0:yb1, tx0:rbound], cv2.COLOR_BGR2GRAY)
+                       if (rbound - tx0) >= 4 and (yb1 - yb0) >= 3 else None)
+                txt = _ocr_strip(sub)
+                _dl("blob cx=%d cy=%d rgb=%s -> curve %s (dist %.0f) text_x=[%d,%d] -> %r"
+                    % (b['cx'], b['cy'], b['rgb'], c, d, tx0, rbound, txt))
+                if len(txt) >= 2:
+                    labels[c] = txt
+            _dl("final labels (multi-col):", labels)
+            return labels
+    except Exception as _me:
+        _dl("multi-column detection failed (%s) -> continuing" % _me)
+
+    # ===== PRIMARY: use the regularised legend grid (rows already known) =========
+    # The grid gives the exact number of rows AND a clean swatch colour per cell,
+    # so we don't re-detect bands (which dropped a row here: 4 found vs 5 curves)
+    # nor re-measure swatch colour from noisy line-markers. We anchor each row at
+    # its grid y, take the swatch colour from the cell, and OCR the text to its
+    # right. Rows map to curves by a global 1:1 colour assignment.
+    _grid = globals().get('_LAST_UNIFIED_GRID')
+    if (_grid and _grid.get('cells') and _grid.get('rows') and _grid.get('cols')
+            and len(curve_names) >= 1):
+        try:
+            g_rows = [int(r) for r in _grid['rows']]
+            g_cols = [int(c) for c in _grid['cols']]
+            # Is the regularised grid trustworthy? If it isn't aligned, or the row
+            # count doesn't match the curve count, its row y's are unreliable (they
+            # were 11px off here and mixed adjacent rows' text). In that case detect
+            # the rows straight from the SWATCH COLUMN instead: the swatches are
+            # evenly spaced and easy to find, unlike the ragged text block.
+            _grid_ok = bool(_grid.get('aligned')) and len(g_rows) == len(curve_names)
+            cell_list = []
+            if _grid_ok:
+                for _key, _cell in _grid['cells'].items():
+                    _ci, _ri = (int(v) for v in _key.split(','))
+                    if _ci >= len(g_cols) or _ri >= len(g_rows):
+                        continue
+                    _crgb = tuple(int(v) for v in _cell.get('rgb', (0, 0, 0)))
+                    cell_list.append((g_rows[_ri], g_cols[_ci], _crgb))
+                cell_list.sort(key=lambda t: (t[0], t[1]))
+                pitch = (g_rows[1] - g_rows[0]) if len(g_rows) > 1 else (ly1 - ly0)
+                _src = "grid cells (aligned)"
+            else:
+                # --- swatch-column row detection (robust to grid misalignment) ---
+                swatch_x = (g_cols[0] - lx0) if g_cols else max(4, panel.shape[1] // 10)
+                zone_w = min(panel.shape[1], max(24, swatch_x + 28))
+                zone = panel[:, :zone_w]
+                zhsv = cv2.cvtColor(zone, cv2.COLOR_BGR2HSV)
+                zgray = cv2.cvtColor(zone, cv2.COLOR_BGR2GRAY)
+                # swatch ink = chromatic OR dark (markers), text is to the right of zone
+                zink = ((zhsv[:, :, 1] > 60) | (zgray < 110)).astype(np.uint8)
+                rsum = zink.sum(axis=1)
+                on = rsum > 1
+                rbands = []
+                y = 0; N = len(on)
+                while y < N:
+                    if on[y]:
+                        y0 = y
+                        while y < N and on[y]:
+                            y += 1
+                        rbands.append((y0, y - 1))
+                    else:
+                        y += 1
+                # merge tiny gaps, drop specks
+                merged = []
+                for b in rbands:
+                    if merged and b[0] - merged[-1][1] <= 3:
+                        merged[-1] = (merged[-1][0], b[1])
+                    else:
+                        merged.append(list(b))
+                merged = [b for b in merged if (b[1] - b[0]) >= 2]
+                centers = [ (b[0]+b[1])//2 for b in merged ]
+                _dl("grid not aligned -> swatch-column rows:", len(centers),
+                    "found for", len(curve_names), "curves")
+                for (b0, b1), cyc in zip(merged, centers):
+                    core = zone[b0:b1+1, :min(zone.shape[1], swatch_x + 14)]
+                    seg = core.reshape(-1, 3)
+                    m = seg[np.any(seg < 235, axis=1)]
+                    if m.size == 0:
+                        continue
+                    med = np.median(m, axis=0)
+                    srgb = (int(med[2]), int(med[1]), int(med[0]))
+                    cell_list.append((cyc + ly0, (g_cols[0] if g_cols else swatch_x+lx0), srgb))
+                cell_list.sort(key=lambda t: t[0])
+                if len(centers) > 1:
+                    gaps = sorted(centers[k+1]-centers[k] for k in range(len(centers)-1))
+                    pitch = gaps[len(gaps)//2]
+                else:
+                    pitch = (ly1 - ly0)
+                _src = "swatch-column detection"
+            pitch = max(6, abs(int(pitch)))
+            _dl("GRID mode:", len(cell_list), "cells x", len(curve_names),
+                "curves; pitch=%dpx; source=%s" % (pitch, _src))
+            if cell_list:
+                # cost = colour distance between each cell rgb and each curve palette rgb
+                cost = np.zeros((len(cell_list), len(curve_names)), dtype=float)
+                for i, (_, _, crgb) in enumerate(cell_list):
+                    for j, c in enumerate(curve_names):
+                        pr, pg, pb = match_rgbs[c]
+                        cost[i, j] = (pr-crgb[0])**2 + (pg-crgb[1])**2 + (pb-crgb[2])**2
+                for i, j in _assign(cost):
+                    ry, cx, crgb = cell_list[i]
+                    c = curve_names[j]
+                    d = cost[i, j] ** 0.5
+                    # row band around the grid row (can't bleed into neighbours)
+                    yb0 = max(0, int(ry - pitch*0.45) - ly0)
+                    yb1 = min(panel.shape[0], int(ry + pitch*0.45) - ly0)
+                    if yb1 - yb0 < 3:
+                        _dl("cell y=%d -> %s: band too thin" % (ry, c)); continue
+                    band = panel[yb0:yb1, :]
+                    bg = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+                    # The swatch is the coloured marker; the label is dark text to
+                    # its right. Detecting the swatch by "dark ink" wrongly eats the
+                    # first digit(s) of the text (e.g. "0.5"). Instead, find where
+                    # the SWATCH COLOUR ends: we know this cell's rgb (dist 0), so
+                    # mark columns that contain a pixel close to that colour. The
+                    # swatch = the first such run from the left; text starts after it.
+                    band_rgb = cv2.cvtColor(band, cv2.COLOR_BGR2RGB).astype(np.int16)
+                    _cr = np.array(crgb, dtype=np.int16)
+                    close = (np.abs(band_rgb - _cr).sum(axis=2) <= 60)   # ~L1 dist
+                    swcols = close.any(axis=0)
+                    xs = np.where(swcols)[0]
+                    if len(xs) == 0:
+                        # achromatic/odd swatch: fall back to leftmost dark ink
+                        inkcols = (bg < 180).any(axis=0)
+                        xs = np.where(inkcols)[0]
+                        swcols = inkcols
+                    if len(xs) == 0:
+                        _dl("cell y=%d -> %s (dist %.0f): no swatch found" % (ry, c, d)); continue
+                    sx0 = xs[0]; sx1 = sx0; gap = 0
+                    for x in range(sx0, band.shape[1]):
+                        if swcols[x]:
+                            sx1 = x; gap = 0
+                        else:
+                            gap += 1
+                            if gap >= 3 and (sx1 - sx0) >= 2:
+                                break
+                    # After the swatch there is a WHITE gap, then the text. Rather
+                    # than a fixed offset (which left marker-line remnants like a
+                    # leading "-", or clipped the first letter), skip past the gap
+                    # and start at the first TEXT column. Text = dark AND achromatic
+                    # (black glyphs); a faint coloured or grey marker-line tail is
+                    # chromatic/grey, so it is NOT mistaken for the first glyph.
+                    band_hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
+                    _V = band_hsv[:, :, 2]; _S = band_hsv[:, :, 1]
+                    textmask = (_V < 120) & (_S < 60)
+                    textcols = textmask.any(axis=0)
+                    tx0 = min(band.shape[1], sx1 + 1)
+                    while tx0 < band.shape[1] and not textcols[tx0]:
+                        tx0 += 1
+                    # small left pad so the first glyph isn't touching the edge
+                    # (kept small so a coloured marker tail isn't pulled in as "-")
+                    tx0 = max(0, tx0 - 2)
+                    txt = _ocr_strip(bg[:, tx0:]) if band.shape[1] - tx0 >= 4 else ''
+                    _dl("cell y=%d swatch=%s span=[%d,%d] text_x0=%d -> curve %s (dist %.0f) -> %r"
+                        % (ry, crgb, sx0, sx1, tx0, c, d, txt))
+                    if len(txt) >= 2:
+                        labels[c] = txt
+                _dl("final labels (grid):", labels)
+                return labels
+        except Exception as _ge:
+            _dl("grid-mode failed (%s) -> falling back to band detection" % _ge)
+
+    # ===== FALLBACK: detect legend rows as ink bands (legacy path) ===============
     # Find legend rows: horizontal bands that contain ink (swatch + text).
     g = cv2.cvtColor(panel, cv2.COLOR_BGR2GRAY)
     ink = (g < 200).astype(np.uint8)
     rowsum = ink.sum(axis=1)
     rows = np.where(rowsum > 2)[0]
     if len(rows) == 0:
+        _dl("no ink rows in legend box -> colour names used")
         return labels
     bands = []
     cur = [rows[0]]
@@ -5940,17 +6577,37 @@ def _curve_labels():
             bands.append((cur[0], cur[-1])); cur = [r]
     bands.append((cur[0], cur[-1]))
 
-    # Detected curve colours in RGB, to match swatches against.
+    # Curve colours to match swatches against. Prefer the LEGEND PALETTE colour
+    # (COLORS' mean_rgb, the ground truth the palette was locked to) over the
+    # in-plot measured colour: overlapping curves / anti-aliasing / JPEG can shift
+    # the in-plot colour so two curves drift together and the assignment swaps.
     curve_names = list(all_detections_out.keys())
     curve_rgbs = {c: _curve_rgb[c] for c in curve_names}
+    _pal_by_name = {}
+    try:
+        for _cd in COLORS:
+            _nm = _cd.get('name'); _mr = _cd.get('mean_rgb')
+            if _nm is not None and _mr is not None and len(_mr) == 3:
+                _pal_by_name[_nm] = (int(_mr[0]), int(_mr[1]), int(_mr[2]))
+    except Exception:
+        _pal_by_name = {}
+    match_rgbs = {c: _pal_by_name.get(c, curve_rgbs[c]) for c in curve_names}
+    _dl("found", len(bands), "legend row band(s);", len(curve_names), "curve(s) to match")
+    _dl("match colours (legend palette preferred):",
+        {c: match_rgbs[c] for c in curve_names})
 
+    # ---- pass 1: measure each band's swatch colour + keep its OCR text strip ----
+    # We only COLLECT here. Matching a swatch to a curve by nearest-colour band by
+    # band (greedy) let two bands bind to the SAME curve, so one curve overwrote
+    # another's label -- i.e. a curve showed a DIFFERENT band's text. Pass 2 does a
+    # global 1:1 assignment so every curve maps to exactly one band.
+    band_rows = []   # (ry0, srgb, strip_thresh_or_None)
     for (ry0, ry1) in bands:
         if ry1 - ry0 < 4:
             continue
         band = panel[ry0:ry1+1, :]
         bh, bw = band.shape[:2]
-        # The swatch is the left-most coloured (chromatic or dark) block. Find the
-        # left region's dominant colour, then the label is the text to its right.
+        # The swatch is the left-most coloured (chromatic or dark) block.
         bhsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
         colmask = (bhsv[:, :, 1] > 60) | (cv2.cvtColor(band, cv2.COLOR_BGR2GRAY) < 110)
         cols_with_ink = np.where(colmask.any(axis=0))[0]
@@ -5974,29 +6631,55 @@ def _curve_labels():
             continue
         med = np.median(bm, axis=0)
         srgb = (int(med[2]), int(med[1]), int(med[0]))
-        # nearest curve colour
-        best_c, best_d = None, 1e9
-        for c in curve_names:
-            r_, g_, b_ = curve_rgbs[c]
-            d = (r_-srgb[0])**2 + (g_-srgb[1])**2 + (b_-srgb[2])**2
-            if d < best_d:
-                best_d, best_c = d, c
-        if best_c is None or best_d > 90**2:      # too far -> no confident match
-            continue
-        # OCR the text to the right of the swatch
+        # text strip to the right of the swatch (thresholded + upscaled for OCR)
         tx0 = swatch_x1 + 2
-        if bw - tx0 < 6:
+        strip_thresh = None
+        if bw - tx0 >= 6:
+            strip = band[:, tx0:]
+            sg = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
+            sg = cv2.resize(sg, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+            _, strip_thresh = cv2.threshold(sg, 150, 255, cv2.THRESH_BINARY)
+        band_rows.append((ry0, srgb, strip_thresh))
+
+    if not band_rows:
+        _dl("no usable swatch bands -> colour names used")
+        return labels
+
+    # ---- pass 2: global 1:1 assignment (Hungarian) between bands and curves ----
+    Dmat = np.zeros((len(band_rows), len(curve_names)), dtype=float)
+    for i, (_, srgb, _) in enumerate(band_rows):
+        for j, c in enumerate(curve_names):
+            r_, g_, b_ = match_rgbs[c]
+            Dmat[i, j] = (r_ - srgb[0])**2 + (g_ - srgb[1])**2 + (b_ - srgb[2])**2
+    try:
+        from scipy.optimize import linear_sum_assignment
+        ri, ci = linear_sum_assignment(Dmat)
+    except Exception as _ae:
+        _dl("Hungarian unavailable (%s) -> greedy fallback" % _ae)
+        ri = list(range(len(band_rows)))
+        ci = [int(np.argmin(Dmat[i])) for i in ri]
+
+    for i, j in zip(ri, ci):
+        ry0, srgb, strip_thresh = band_rows[i]
+        c = curve_names[j]
+        d = Dmat[i, j] ** 0.5
+        if d > 160:      # reject only truly impossible matches (non-curve legend rows)
+            _dl("band y=%d swatch=%s -> %s REJECTED (colour dist %.0f > 160)" % (ry0, srgb, c, d))
             continue
-        strip = band[:, tx0:]
-        sg = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
-        sg = cv2.resize(sg, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-        _, sg = cv2.threshold(sg, 150, 255, cv2.THRESH_BINARY)
+        if strip_thresh is None:
+            _dl("band y=%d -> %s but no text strip to the right" % (ry0, c))
+            continue
         try:
-            txt = ' '.join(pytesseract.image_to_string(sg, config='--psm 7').split())
-        except Exception:
-            txt = ''
+            txt = ' '.join(pytesseract.image_to_string(strip_thresh, config='--psm 7').split())
+        except Exception as _oe:
+            _dl("band y=%d OCR error: %s" % (ry0, _oe)); txt = ''
+        _dl("band y=%d swatch=%s -> curve %s (dist %.0f) -> %r" % (ry0, srgb, c, d, txt))
+        # Only overwrite the default (colour name) when OCR actually read text.
+        # On failure the curve keeps its OWN colour-name default -- it must NEVER
+        # inherit another band's text.
         if len(txt) >= 2:
-            labels[best_c] = txt
+            labels[c] = txt
+    _dl("final labels:", labels)
     return labels
 
 _CURVE_LABEL = _curve_labels()
@@ -6134,10 +6817,51 @@ try:
         # differently-ordered raw-grid list mismatched them).
         _pal = getattr(_dig, 'palette', None)
         _mask_manifest = []
+        # --- mask contamination diagnostics (DEBUG_MASKS=1) ---------------------
+        # For each mask, report how many of its pixels are FAR from that curve's
+        # own legend colour, and which OTHER curve those foreign pixels actually
+        # belong to. This pinpoints colour bleed (e.g. a blue mask carrying purple
+        # "1 mg/kg SC" pixels) with numbers instead of eyeballing the PNG.
+        _DBGM = os.environ.get('DEBUG_MASKS')
+        _sw_map = {}
+        try:
+            for _cd in COLORS:
+                _nm = _cd.get('name')
+                _sr = _cd.get('swatch_rgb') or _cd.get('mean_rgb')
+                if _nm is not None and _sr is not None:
+                    _sw_map[_nm] = np.array([int(_sr[0]), int(_sr[1]), int(_sr[2])])
+        except Exception:
+            _sw_map = {}
         for _k, _cname in enumerate(_names):
             if getattr(_dig, 'is_sink', None) is not None and _k < len(_dig.is_sink) and _dig.is_sink[_k]:
                 continue
             _m = (_asg == _k)
+            if _DBGM and _m.sum() > 0 and _cname in _sw_map:
+                _own = _sw_map[_cname]
+                _mpx = img_rgb[_m].astype(int)                    # (N,3) RGB
+                _med_actual = np.median(_mpx, axis=0).astype(int)  # what the mask REALLY is
+                _dself = np.linalg.norm(_mpx - _own[None, :], axis=1)
+                _far = _dself > 60                                # foreign-looking px
+                _nfar = int(_far.sum()); _ntot = int(_m.sum())
+                _msg = ("  [mask %02d %s] own=%s actual_median=%s  %d px, foreign %d (%d%%)"
+                        % (_k, _cname, tuple(int(v) for v in _own),
+                           tuple(int(v) for v in _med_actual),
+                           _ntot, _nfar, round(100*_nfar/max(_ntot, 1))))
+                if _nfar > 0:
+                    # attribute each foreign pixel to the NEAREST other curve
+                    _oth_names = [n for n in _sw_map if n != _cname]
+                    if _oth_names:
+                        _oc = np.stack([_sw_map[n] for n in _oth_names])   # (M,3)
+                        _fp = _mpx[_far]                                    # (F,3)
+                        _dd = np.linalg.norm(_fp[:, None, :] - _oc[None, :, :], axis=2)
+                        _nn = _dd.argmin(axis=1)
+                        _cnt = {}
+                        for _j in _nn:
+                            _cnt[_oth_names[_j]] = _cnt.get(_oth_names[_j], 0) + 1
+                        _top = sorted(_cnt.items(), key=lambda kv: -kv[1])[:3]
+                        _msg += " | bleed-> " + ", ".join(
+                            "%s:%d" % (n, c) for n, c in _top)
+                print(_msg, flush=True)
             _canvas = np.full((H, W, 3), 255, np.uint8)
             _canvas[_m] = img[_m]                     # original pixel colours
             _pts = all_detections_out.get(_cname, [])
@@ -6150,6 +6874,7 @@ try:
             _lrgb = ([int(v) for v in _pal[_k]]
                      if (_pal is not None and _k < len(_pal)) else None)
             _mask_manifest.append({'name': _cname, 'file': _fname,
+                                   'label': _CURVE_LABEL.get(_cname, _cname),
                                    'mask_px': int(_m.sum()), 'points': len(_pts),
                                    'legend_rgb': _lrgb})
         with open(os.path.join(OUT_DIR, 'colormasks.json'), 'w') as _mf:
