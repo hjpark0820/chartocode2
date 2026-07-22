@@ -27,6 +27,38 @@ _SERIES_PALETTE = [
     [148, 103, 189], [140, 86, 75], [227, 119, 194], [127, 127, 127],
     [188, 189, 34], [23, 190, 207],
 ]
+# Per-class marker colours used by the detection overlay. Reusing them here keeps
+# the reconstructed plot's curve colours (a) stable across repeated Step-5 runs and
+# (b) identical to the coloured markers drawn on the original image.
+try:                                  # run_gui_v2 is already imported by the CLI
+    from run_gui_v2 import MARKER_COLORS as _MARKER_COLORS   # RGB tuples
+except Exception:                     # standalone use: keep the values in sync
+    _MARKER_COLORS = {
+        "filled_circle":       (220,  30,  30),
+        "open_circle":         (230, 100,   0),
+        "filled_square":       ( 20, 160,  20),
+        "open_square":         (  0, 130, 200),
+        "open_triangle":       ( 80,  30, 220),
+        "open_inv_triangle":   (200,   0, 200),
+        "filled_triangle":     (  0, 190, 190),
+        "filled_inv_triangle": (180,  60, 180),
+        "open_rhombus":        (220, 180,   0),
+        "filled_rhombus":      (160,  80,   0),
+        "x_marker":            ( 30, 180, 100),
+        "plus_marker":         (255,  20, 120),
+    }
+_CLASS_ORDER = list(_MARKER_COLORS.keys())   # stable fallback ordering
+
+
+def _series_rgb(cls: str) -> list:
+    """Colour for a curve, keyed by CLASS NAME (never by iteration order)."""
+    c = _MARKER_COLORS.get(cls)
+    if c is not None:
+        return [int(c[0]), int(c[1]), int(c[2])]
+    idx = _CLASS_ORDER.index(cls) if cls in _CLASS_ORDER else abs(hash(cls))
+    return list(_SERIES_PALETTE[idx % len(_SERIES_PALETTE)])
+
+
 _CLASS_LABEL = {
     "filled_circle": "Filled circle", "open_circle": "Open circle",
     "filled_square": "Filled square", "open_square": "Open square",
@@ -77,7 +109,7 @@ def bw_to_edit_data(
         curves.append({
             "name": cls,
             "label": labels.get(cls) or _CLASS_LABEL.get(cls, cls),
-            "rgb": _SERIES_PALETTE[i % len(_SERIES_PALETTE)],
+            "rgb": _series_rgb(cls),
             "points": pts,
         })
 

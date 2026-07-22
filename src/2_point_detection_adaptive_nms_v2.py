@@ -12,7 +12,7 @@ Pipeline
      - Build a 1-D KDE over all raw cx values.
      - Find local maxima (modes) of the KDE.
      - Estimate d = median of consecutive mode spacings.
-4. Set  window_width = 0.75 * d.
+4. Set  window_width = 0.6 * d.
 5. Apply per-class sliding-window x-column NMS with the adaptive window_width.
    The window slides 1 px at a time across the full image width.  Within each
    window position, the highest-confidence detection per class is kept; all
@@ -213,10 +213,11 @@ def detect_with_adaptive_nms(
         conf_thresh      = None,
         stride           = None,
         bandwidth_factor = 0.3,
-        bin_width_factor = 1.0,
+        bin_width_factor = 0.6,
         batch_size       = 512,
         prep_info        = None,
         d_override       = None,
+        plot_area        = None,
 ):
     """
     Full pipeline: sliding-window detection -> adaptive NMS.
@@ -242,7 +243,7 @@ def detect_with_adaptive_nms(
     bandwidth_factor : float
         KDE bandwidth = bandwidth_factor * P  (default 0.3).
     bin_width_factor : float
-        adaptive bin_width = bin_width_factor * d  (default 0.75).
+        adaptive bin_width = bin_width_factor * d  (default 0.6).
     batch_size : int
         Number of patches per GPU/CPU forward pass (default 512).
     prep_info : dict or None
@@ -290,6 +291,7 @@ def detect_with_adaptive_nms(
     # axis/legend/text pixels are excluded from the dark-pixel check.
     # The sliding-window scan is also restricted to the detected plot area.
     _clean_mask = None
+    _img_for_vit = img_gray   # patches fed to the ViT; replaced with a cleaned copy below
     _scan_x0 = 0; _scan_y0 = 0; _scan_x1 = W; _scan_y1 = H
     if prep_info is not None:
         # Build cleaned binary mask
@@ -297,6 +299,15 @@ def detect_with_adaptive_nms(
         _, _bw_tmp = cv2.threshold(_gray_tmp, 128, 255, cv2.THRESH_BINARY_INV)
         _bw_tmp = (_bw_tmp > 0).astype('uint8')
         _clean_mask = prep_info['clean_fn'](_bw_tmp)
+        # Feed the ViT an axis/text-REMOVED image. clean_fn already removes axis
+        # lines, ticks, labels and the LLOQ line while PRESERVING markers
+        # (_remove_axis_lines_preserve_markers). Here we white out ONLY the dark
+        # pixels clean_fn removed, keeping every marker pixel (and its anti-aliasing)
+        # intact. This stops the ViT from firing on axis structure while still
+        # detecting real markers that sit on or beside the axis.
+        _removed = (_bw_tmp > 0) & (np.asarray(_clean_mask) == 0)
+        _img_for_vit = img_gray.copy()
+        _img_for_vit[_removed] = 255
         # Restrict scan to plot area
         pa = prep_info.get('plot_area', None)
         if pa is not None:
@@ -320,7 +331,7 @@ def detect_with_adaptive_nms(
             if ci == mod.N_SYMBOLS:
                 continue
             elif max_prob < unknown_thresh:
-                patch = mod.extract_patch_padded(img_gray, bx, by, P)
+                patch = mod.extract_patch_padded(_img_for_vit, bx, by, P)
                 ecx, ecy = mod._estimate_center_in_patch(bx, by, patch, P)
                 raw_dets.append({
                     'cx': ecx, 'cy': ecy,
@@ -328,7 +339,7 @@ def detect_with_adaptive_nms(
                     'confidence': round(max_prob, 4),
                 })
             elif max_prob >= _conf_thresh:
-                patch = mod.extract_patch_padded(img_gray, bx, by, P)
+                patch = mod.extract_patch_padded(_img_for_vit, bx, by, P)
                 ecx, ecy = mod._estimate_center_in_patch(bx, by, patch, P)
                 raw_dets.append({
                     'cx': ecx, 'cy': ecy,
@@ -341,7 +352,7 @@ def detect_with_adaptive_nms(
 
     for cy_w in range(_scan_y0, _scan_y1, _stride):
         for cx_w in range(_scan_x0, _scan_x1, _stride):
-            patch = mod.extract_patch_padded(img_gray, cx_w, cy_w, P)
+            patch = mod.extract_patch_padded(_img_for_vit, cx_w, cy_w, P)
             # Use cleaned mask if available: count dark pixels only in clean regions
             if _clean_mask is not None:
                 # Extract the corresponding patch from the clean mask
@@ -363,9 +374,41 @@ def detect_with_adaptive_nms(
 
     # estimate adaptive bin width
     symbol_dets = [d for d in raw_dets if d['class_idx'] >= 0]
-    all_cx      = [d['cx'] for d in symbol_dets]
+
+    # Restrict the KDE input to detections INSIDE the plot area, so axis-label /
+    # legend / border detections don't contaminate the mode-spacing estimate.
+    # (Those outliers previously inflated d_est, widening the NMS window and
+    # over-merging closely-spaced data points.) Plot area comes from the explicit
+    # plot_area arg, else from prep_info.
+    _pa_kde = plot_area if plot_area is not None else (
+        prep_info.get('plot_area', None) if prep_info is not None else None)
+    if _pa_kde is not None:
+        _kx0, _ky0, _kx1, _ky1 = _pa_kde
+        _cx_in_plot = [d['cx'] for d in symbol_dets
+                       if _kx0 <= d['cx'] <= _kx1 and _ky0 <= d['cy'] <= _ky1]
+        # only use the filtered set if it leaves enough points for a stable KDE
+        all_cx = _cx_in_plot if len(_cx_in_plot) >= 2 else [d['cx'] for d in symbol_dets]
+    else:
+        all_cx = [d['cx'] for d in symbol_dets]
 
     result = estimate_mode_distance(all_cx, W, bandwidth_factor=bandwidth_factor)
+
+    # [d_est-diag] Log the raw-cx distribution + KDE peaks that produce d_est, so the
+    # exact source of the 'd_est' value can be inspected/plotted. (Runs once per image;
+    # when upscaling, this fires for BOTH the original-scale pass (-> d_override) and the
+    # upscaled pass. Tell them apart by the image width W printed below.)
+    import os as _os_dd
+    if _os_dd.environ.get("POINT_DIAG", "1") != "0" and result[0] is not None:
+        try:
+            _dd, _, _, _dpk, _dmx, _dsp = result
+            print(f"  [d_est-diag] image_width={W}  raw_cx={len(all_cx)} detections  "
+                  f"x=[{min(all_cx):.0f},{max(all_cx):.0f}]  bandwidth={bandwidth_factor}xP")
+            print(f"  [d_est-diag] KDE peaks ({len(_dmx)}): " + " ".join(f"{v:.0f}" for v in _dmx))
+            print(f"  [d_est-diag] peak spacings: " + " ".join(f"{v:.0f}" for v in _dsp)
+                  + f"  -> median d_est={_dd:.1f}px")
+            print(f"  [d_est-diag] all_cx (sorted): " + " ".join(f"{v:.0f}" for v in sorted(all_cx)))
+        except Exception as _dde:
+            print(f"  [d_est-diag] logging failed: {_dde}")
 
     if result[0] is None:
         d_est              = None
@@ -442,7 +485,7 @@ def _save_diagnostics(
     ax.set_title(
         f'X-coordinate distribution of all raw symbol detections\n'
         f'(n={len(all_cx)})  KDE bandwidth=0.3xP={0.3*P:.0f}px  |  '
-        f'd={title_d}  |  adaptive bin=0.75xd={title_bin}',
+        f'd={title_d}  |  adaptive bin=0.6xd={title_bin}',
         fontsize=11,
     )
     ax.hist(all_cx, bins=np.arange(0, W + 1, 2), color='steelblue',
@@ -496,7 +539,7 @@ def _save_diagnostics(
     axes[0].imshow(img_rgb);   axes[0].set_title('Original', fontsize=11); axes[0].axis('off')
     axes[1].imshow(img_adapt)
     axes[1].set_title(
-        f'Adaptive NMS  (bin=0.75xd={adaptive_bin_width:.1f}px, d={title_d})\n'
+        f'Adaptive NMS  (bin=0.6xd={adaptive_bin_width:.1f}px, d={title_d})\n'
         f'kept={len(kept)}, suppressed={len(suppressed)}',
         fontsize=10,
     )

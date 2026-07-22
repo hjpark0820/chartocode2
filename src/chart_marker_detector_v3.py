@@ -1600,12 +1600,19 @@ def detect(image_path: str,
     batch_coords: list[tuple[int,int]] = []
     batch_tensors: list[np.ndarray]    = []
 
+    import time as _time
+    _tstats = {"fwd": 0.0, "batches": 0, "patches": 0}
+
     def flush_batch():
         if not batch_tensors: return
+        _t0 = _time.perf_counter()
         t = torch.tensor(np.stack(batch_tensors), dtype=torch.float32).to(device)
         with torch.no_grad():
             with autocast(enabled=(device.type == "cuda")):
                 probs = torch.softmax(model(t), dim=1).cpu().numpy()
+        _tstats["fwd"]     += _time.perf_counter() - _t0
+        _tstats["batches"] += 1
+        _tstats["patches"] += len(batch_tensors)
         for (bx, by), prob in zip(batch_coords, probs):
             max_prob = float(prob.max())
             ci       = int(prob.argmax())
@@ -1629,15 +1636,45 @@ def detect(image_path: str,
                 })
         batch_coords.clear(); batch_tensors.clear()
 
-    for cy_w in range(0, H, stride):
-        for cx_w in range(0, W, stride):
+    # ── Ink-region restriction (skip the white ~90% of the chart) ─────────────
+    # Precompute the ink mask + integral image ONCE; then check each window's ink
+    # count in O(1) and only touch/forward patches where ink actually is. This
+    # yields IDENTICAL detections (same threshold, same grid positions) but avoids
+    # extracting + thresholding a patch at every white location.
+    _ink = (img_gray <= 200).astype(np.uint8)
+    _ink_int = cv2.integral(_ink)                      # (H+1, W+1) summed-area table (int32)
+    _ys_ink, _xs_ink = np.nonzero(_ink)
+    if _xs_ink.size == 0:
+        return []                                       # blank image → nothing to detect
+    # restrict scan to the ink bounding box, grid-aligned so positions stay identical
+    _scan_y0 = ((max(0, int(_ys_ink.min()) - half)) // stride) * stride
+    _scan_x0 = ((max(0, int(_xs_ink.min()) - half)) // stride) * stride
+    _scan_y1 = min(H, int(_ys_ink.max()) + half + 1)
+    _scan_x1 = min(W, int(_xs_ink.max()) + half + 1)
+
+    def _window_ink_count(cx_w, cy_w):
+        ax0 = max(0, cx_w - half); ay0 = max(0, cy_w - half)
+        ax1 = min(W, cx_w - half + p); ay1 = min(H, cy_w - half + p)
+        if ax1 <= ax0 or ay1 <= ay0:
+            return 0
+        return int(_ink_int[ay1, ax1] - _ink_int[ay0, ax1]
+                   - _ink_int[ay1, ax0] + _ink_int[ay0, ax0])
+
+    _t_scan0 = _time.perf_counter()
+    for cy_w in range(_scan_y0, _scan_y1, stride):
+        for cx_w in range(_scan_x0, _scan_x1, stride):
+            if _window_ink_count(cx_w, cy_w) < min_dark_pixels:
+                continue
             patch = extract_patch_padded(img_gray, cx_w, cy_w, p)
-            _, bw = cv2.threshold(patch, 200, 255, cv2.THRESH_BINARY_INV)
-            if np.count_nonzero(bw) < min_dark_pixels: continue
             batch_coords.append((cx_w, cy_w))
             batch_tensors.append(patch_to_tensor(patch))
             if len(batch_tensors) == 512: flush_batch()
     flush_batch()
+    _t_scan = _time.perf_counter() - _t_scan0
+    print(f"  [timing] device={device.type}  image={W}x{H}  "
+          f"patches_forwarded={_tstats['patches']} in {_tstats['batches']} batches  |  "
+          f"ViT forward={_tstats['fwd']:.2f}s  scan+forward total={_t_scan:.2f}s  "
+          f"(forward = {100*_tstats['fwd']/max(_t_scan,1e-9):.0f}% of it)")
 
     symbol_dets  = [d for d in raw_dets if d["class_idx"] >= 0]
     unknown_dets = [d for d in raw_dets if d["class_idx"] == -1]

@@ -108,31 +108,49 @@
 
       <hr style="border:none; border-top:1px solid var(--border); margin:16px 0;">
       <div style="font-size:13px; font-weight:600; margin-bottom:8px;">Axis values <span id="axisReq" style="display:none; color:var(--accent);">(required for B&amp;W)</span><span id="axisOpt">(optional)</span></div>
-      <p class="hint" style="margin-top:0;">Values map to the plot-area edges. <span id="axisOcrHint">Leave blank to read the numbers automatically (OCR).</span></p>
-      <div class="axisgrid">
-        <label>x min <input id="xMin" type="text" inputmode="text" placeholder="auto"></label>
-        <label>x max <input id="xMax" type="text" inputmode="text" placeholder="auto"></label>
-        <label>y min <input id="yMin" type="text" inputmode="text" placeholder="e.g. 1e-15 or 10^-15"></label>
-        <label>y max <input id="yMax" type="text" inputmode="text" placeholder="auto"></label>
+      <p class="hint" style="margin-top:0;"><span id="axisMapHint">Leave off to read the axis numbers automatically (OCR).</span></p>
+      <label style="font-size:13px;"><input id="useScaleBox" type="checkbox"> Use a separate <b>scale box</b> (optional)</label>
+      <div class="hint" style="margin-top:2px;">
+        Turn this on to type the axis values. Draw the scale box exactly on the axes, so the
+        plot area can be drawn larger (to catch points sitting on or just outside them)
+        without making the values ambiguous.
       </div>
-      <div class="axischecks">
-        <label><input id="xLog" type="checkbox"> x log scale</label>
-        <label><input id="yLog" type="checkbox"> y log scale</label>
+      <div id="scaleBoxPanel" style="display:none; margin-top:8px;">
+        <div style="margin-bottom:8px;">
+          <button id="btnScale" data-tool="scale" class="toolbtn"><span class="swatch" style="background:#e08a1e"></span>Draw scale box</button>
+          <span id="scaleBoxInfo" class="hint" style="margin-left:8px;">drag the box exactly on the axes</span>
+        </div>
+        <div class="axisgrid">
+          <label>x min <input id="xMin" type="text" inputmode="text" placeholder="auto"></label>
+          <label>x max <input id="xMax" type="text" inputmode="text" placeholder="auto"></label>
+          <label>y min <input id="yMin" type="text" inputmode="text" placeholder="e.g. 1e-15 or 10^-15"></label>
+          <label>y max <input id="yMax" type="text" inputmode="text" placeholder="auto"></label>
+        </div>
+        <div class="axischecks">
+          <label><input id="xLog" type="checkbox"> x log scale</label>
+          <label><input id="yLog" type="checkbox"> y log scale</label>
+        </div>
       </div>
+
+
 
       <div id="bwPanel" style="display:none; margin-top:14px; padding-top:12px; border-top:1px dashed var(--border);">
         <div style="font-size:13px; font-weight:600; margin-bottom:8px;">B&amp;W options</div>
         <div style="font-size:13px; margin-bottom:6px;">Marker shapes to detect</div>
         <div id="bwClasses" class="markergrid"></div>
         <p class="hint" style="margin-top:8px;">Tick the marker shapes present in your plot. None ticked = try all 12 shapes.</p>
-        <label style="display:block; margin-top:10px;">Confidence <input id="bwConf" type="text" inputmode="decimal" placeholder="auto (0-1)" style="width:90px;"></label>
         <div style="margin-top:10px;">
           <span style="font-size:13px;">Scale:</span>
           <label style="margin-left:6px;"><input type="radio" name="bwScaleMode" value="auto" checked> Auto (from legend)</label>
           <label style="margin-left:8px;"><input type="radio" name="bwScaleMode" value="manual"> Manual</label>
           <input id="bwScaleVal" type="text" inputmode="decimal" value="1.0" disabled style="width:70px; margin-left:6px;">
         </div>
-        <label style="display:block; margin-top:8px;"><input id="bwErrbars" type="checkbox"> plot has error bars</label>
+        <div style="margin-top:8px;">
+          <span style="font-size:13px;">Error bars:</span>
+          <label style="margin-left:6px;"><input type="radio" name="bwErrbars" value="" checked> Auto (detect)</label>
+          <label style="margin-left:8px;"><input type="radio" name="bwErrbars" value="1"> Present</label>
+          <label style="margin-left:8px;"><input type="radio" name="bwErrbars" value="0"> None</label>
+        </div>
       </div>
 
       <button id="run" disabled>Run</button>
@@ -147,24 +165,17 @@
     <!-- Right: result -->
     <div class="panel" id="result" style="min-width:320px; display:none;">
       <div id="summary" style="font-size:14px; margin-bottom:10px;"></div>
-      <img id="resultImg" alt="data point overlay">
-      <div id="compareBox" style="display:none;">
-        <div style="display:flex; gap:12px; flex-wrap:wrap;">
-          <div style="flex:1; min-width:220px;">
-            <div style="font-size:12px; font-weight:600; color:var(--muted,#6b6b6b); margin-bottom:4px;">Before — Step 4 (detection)</div>
-            <img id="compareImg4" alt="step 4 result" style="width:100%; border:1px solid var(--border); border-radius:8px;">
-          </div>
-          <div style="flex:1; min-width:220px;">
-            <div style="font-size:12px; font-weight:600; color:var(--accent); margin-bottom:4px;">After — Step 5 (correction)</div>
-            <img id="compareImg5" alt="step 5 result" style="width:100%; border:1px solid var(--accent); border-radius:8px;">
-          </div>
-        </div>
+      <div style="margin-bottom:10px;">
+        <button id="clearHistory" style="padding:6px 12px; background:#fff; color:#666; border:1px solid var(--border); border-radius:6px; cursor:pointer; font-size:12px;">Clear results</button>
+        <span class="hint" style="margin-left:8px;">Each Run starts fresh; each Step-5 correction is added below for comparison.</span>
       </div>
+      <div id="resultsHistory"></div>
       <br>
       <a id="downloadXlsx" href="#">Download data file (.xlsx)</a>
       <button id="openEditor" style="display:none; margin-top:12px; margin-left:8px; padding:10px 16px; background:var(--accent); color:#fff; border:none; border-radius:8px; cursor:pointer; font-size:14px;">Correct data points →</button>
       <button id="toggleDiag" style="display:none; margin-top:12px; margin-left:8px; padding:10px 16px; background:#fff; color:#333; border:1px solid var(--border); border-radius:8px; cursor:pointer; font-size:14px;">Show legend fit diagnostic</button>
       <button id="toggleMasks" style="display:none; margin-top:12px; margin-left:8px; padding:10px 16px; background:#fff; color:#333; border:1px solid var(--border); border-radius:8px; cursor:pointer; font-size:14px;">Show colour masks</button>
+      <label id="correctItersWrap" style="display:none; margin-top:12px; margin-left:8px; font-size:13px; color:#333;">Correction iterations: <input id="bwCorrectIters" type="number" min="1" max="50" value="5" style="width:60px; padding:4px;"></label>
       <button id="btnStep5" style="display:none; margin-top:12px; margin-left:8px; padding:10px 16px; background:#fff; color:var(--accent); border:1px solid var(--accent); border-radius:8px; cursor:pointer; font-size:14px;">Run Step 5 correction ↻</button>
       <div id="diagBox" style="display:none; margin-top:12px;">
         <div class="hint">Legend detection diagnostic — is the table fitted correctly? green = accepted colour swatch · cyan = accepted grey/black key · orange = rejected (near-neutral) · yellow = rejected (no text label beside it) · red = rejected (size/shape).</div>
@@ -223,7 +234,7 @@ let img = new Image();
 let imgLoaded = false;
 let scale = 1;
 let tool = null;
-let boxes = { legend: null, plot: null };
+let boxes = { legend: null, plot: null, scale: null };
 let drag = null;
 let fileBlob = null;
 let APP_MODE = 'color';                // 'color' | 'bw'
@@ -296,7 +307,7 @@ document.querySelectorAll('input[name="bwScaleMode"]').forEach(r => {
   });
 });
 
-const COLORS = { legend: '#d64545', plot: '#1d9e75' };
+const COLORS = { legend: '#d64545', plot: '#1d9e75', scale: '#e08a1e' };
 
 document.getElementById('fileInput').addEventListener('change', e => {
   const f = e.target.files[0];
@@ -310,7 +321,7 @@ document.getElementById('fileInput').addEventListener('change', e => {
     scale = Math.min(1, maxW / img.width);
     canvas.width = Math.round(img.width * scale);
     canvas.height = Math.round(img.height * scale);
-    boxes = { legend: null, plot: null };
+    boxes = { legend: null, plot: null, scale: null };
     updateInfo();
     redraw();
     document.getElementById('run').disabled = false;
@@ -318,18 +329,21 @@ document.getElementById('fileInput').addEventListener('change', e => {
   img.src = url;
 });
 
-for (const b of [document.getElementById('btnLegend'), document.getElementById('btnPlot')]) {
+for (const b of [document.getElementById('btnLegend'), document.getElementById('btnPlot'),
+                 document.getElementById('btnScale')]) {
   b.addEventListener('click', () => {
     tool = (tool === b.dataset.tool) ? null : b.dataset.tool;
     document.getElementById('btnLegend').classList.toggle('active', tool === 'legend');
     document.getElementById('btnPlot').classList.toggle('active', tool === 'plot');
+    document.getElementById('btnScale').classList.toggle('active', tool === 'scale');
   });
 }
 document.getElementById('btnClear').addEventListener('click', () => {
-  boxes = { legend: null, plot: null };
+  boxes = { legend: null, plot: null, scale: null };
   tool = null;
   document.getElementById('btnLegend').classList.remove('active');
   document.getElementById('btnPlot').classList.remove('active');
+  document.getElementById('btnScale').classList.remove('active');
   for (const id of ['xMin','xMax','yMin','yMax']) document.getElementById(id).value = '';
   document.getElementById('xLog').checked = false;
   document.getElementById('yLog').checked = false;
@@ -343,6 +357,41 @@ function canvasPos(e) {
   return { x: Math.max(0, Math.min(canvas.width, cx)),
            y: Math.max(0, Math.min(canvas.height, cy)) };
 }
+// ── optional scale box ───────────────────────────────────────────────────────
+function scaleBoxOn() { return document.getElementById('useScaleBox').checked; }
+function scaleBoxUpdate() {
+  const on = scaleBoxOn();
+  document.getElementById('scaleBoxPanel').style.display = on ? 'block' : 'none';
+  document.getElementById('axisMapHint').textContent =
+    on ? 'Values map to the scale box edges (if no scale box is drawn, to the plot area).'
+       : 'Leave off to read the axis numbers automatically (OCR).';
+  const info = document.getElementById('scaleBoxInfo');
+  if (info) info.textContent = boxes.scale
+    ? ('scale box: ' + boxes.scale.join(', '))
+    : 'drag the box exactly on the axes';
+  if (!on && boxes.scale) { boxes.scale = null; }
+  if (!on && tool === 'scale') {
+    tool = null;
+    document.getElementById('btnScale').classList.remove('active');
+  }
+  redraw();
+}
+document.getElementById('useScaleBox').addEventListener('change', scaleBoxUpdate);
+
+// Map two reference points on one axis onto another box's edges.
+// Used to convert the calibration (Plot area) box into the equivalent range that
+// a larger Detection area box spans, so px_to_data downstream needs no changes.
+function _axisRange(p1, v1, p2, v2, edgeLo, edgeHi, isLog) {
+  if (p1 === p2 || !isFinite(v1) || !isFinite(v2)) return null;
+  if (isLog) {
+    if (v1 <= 0 || v2 <= 0) return null;
+    const l1 = Math.log10(v1), sl = (Math.log10(v2) - Math.log10(v1)) / (p2 - p1);
+    return [Math.pow(10, l1 + (edgeLo - p1) * sl), Math.pow(10, l1 + (edgeHi - p1) * sl)];
+  }
+  const sl = (v2 - v1) / (p2 - p1);
+  return [v1 + (edgeLo - p1) * sl, v1 + (edgeHi - p1) * sl];
+}
+
 canvas.addEventListener('pointerdown', e => {
   if (!imgLoaded || !tool) return;
   const p = canvasPos(e);
@@ -365,7 +414,9 @@ canvas.addEventListener('pointerup', e => {
     boxes[tool] = [Math.round(x0), Math.round(y0), Math.round(x1), Math.round(y1)];
   }
   drag = null;
-  updateInfo(); redraw();
+  updateInfo();
+  if (typeof scaleBoxUpdate === 'function' && scaleBoxOn()) scaleBoxUpdate();
+  redraw();
 });
 
 function updateInfo() {
@@ -376,7 +427,7 @@ function redraw() {
   if (!imgLoaded) return;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-  for (const key of ['legend', 'plot']) {
+  for (const key of ['legend', 'plot', 'scale']) {
     const b = boxes[key];
     if (!b) continue;
     ctx.strokeStyle = COLORS[key];
@@ -432,10 +483,28 @@ async function runDigitize(withCorrect) {
   fd.append('mode', APP_MODE);
   if (boxes.legend) fd.append(APP_MODE === 'bw' ? 'legend_area' : 'legend_box', boxes.legend.join(','));
   if (boxes.plot)   fd.append('plot_area',  boxes.plot.join(','));
-  const xMin = parseAxisValue(document.getElementById('xMin').value);
-  const xMax = parseAxisValue(document.getElementById('xMax').value);
-  const yMin = parseAxisValue(document.getElementById('yMin').value);
-  const yMax = parseAxisValue(document.getElementById('yMax').value);
+  let xMin = parseAxisValue(document.getElementById('xMin').value);
+  let xMax = parseAxisValue(document.getElementById('xMax').value);
+  let yMin = parseAxisValue(document.getElementById('yMin').value);
+  let yMax = parseAxisValue(document.getElementById('yMax').value);
+  // With a scale box the typed values refer to IT, not to the plot area that the
+  // pipeline receives. Re-express the range over the plot area so downstream
+  // px->data (which assumes the range spans plot_area) stays correct.
+  const _cal = (scaleBoxOn() ? boxes['scale'] : null), _det = boxes['plot'];
+  if (_det && _cal) {
+    const n = v => parseFloat(v);
+    const xr = _axisRange(_cal[0], n(xMin), _cal[2], n(xMax), _det[0], _det[2],
+                          document.getElementById('xLog').checked);
+    // y: bottom edge -> y_min, top edge -> y_max
+    const yr = _axisRange(_cal[3], n(yMin), _cal[1], n(yMax), _det[3], _det[1],
+                          document.getElementById('yLog').checked);
+    if (!xr || !yr) {
+      alert('Scale box: enter x/y min and max (they refer to the scale box) first.');
+      throw new Error('range needed for scale-box rescale');
+    }
+    xMin = String(xr[0]); xMax = String(xr[1]);
+    yMin = String(yr[0]); yMax = String(yr[1]);
+  }
   if (xMin) fd.append('x_min', xMin);
   if (xMax) fd.append('x_max', xMax);
   if (yMin) fd.append('y_min', yMin);
@@ -445,16 +514,24 @@ async function runDigitize(withCorrect) {
   if (APP_MODE === 'bw') {
     const cls = selectedMarkers();
     if (cls.length) fd.append('known_classes', cls.join(','));
-    const cf = document.getElementById('bwConf').value.trim();
-    if (cf) fd.append('conf', cf);
     // Scale: Manual sends the value; Auto omits it so the server auto-detects from legend.
     const scaleMode = document.querySelector('input[name="bwScaleMode"]:checked').value;
     if (scaleMode === 'manual') {
       const sv = document.getElementById('bwScaleVal').value.trim();
       if (sv) fd.append('scale', sv);
     }
-    fd.append('has_errorbars', document.getElementById('bwErrbars').checked ? '1' : '0');
-    if (withCorrect) fd.append('correct', '1');   // Step 5 runs only on explicit request
+    fd.append('has_errorbars', document.querySelector('input[name="bwErrbars"]:checked').value);
+  }
+  // Step 5 is available in BOTH pipelines, so these must be sent outside the
+  // B&W-only block (they used to sit inside it, which silently disabled the
+  // colour correction: the server never saw correct=1).
+  if (withCorrect) {
+    fd.append('correct', '1');   // Step 5 runs only on explicit request
+    const _ci = document.getElementById('bwCorrectIters');
+    if (_ci && _ci.value.trim()) fd.append('correct_iters', _ci.value.trim());
+    // Continue from the previous run's corrected state so repeated Step-5
+    // presses compose instead of restarting from a fresh detection.
+    if (window._lastJobId) fd.append('prev_job', window._lastJobId);
   }
   try {
     const res = await fetch('/digitize', { method: 'POST', body: fd });
@@ -464,21 +541,29 @@ async function runDigitize(withCorrect) {
     document.getElementById('result').style.display = 'block';
     document.getElementById('summary').textContent = data.summary || '';
     const overlayUrl = data.overlay_url + '?t=' + Date.now();
-    const resultImg = document.getElementById('resultImg');
-    const compareBox = document.getElementById('compareBox');
-    if (withCorrect && window._step4Overlay) {
-      // Step 5: show Step-4 (before) beside the corrected Step-5 (after).
-      resultImg.style.display = 'none';
-      compareBox.style.display = 'block';
-      document.getElementById('compareImg4').src = window._step4Overlay;
-      document.getElementById('compareImg5').src = overlayUrl;
+    // Append a new pair (original+markers | reconstructed) to the results history.
+    // A fresh Run starts a new history; each Step-5 correction stacks below it so
+    // successive corrections can be compared side by side (nothing is discarded).
+    if (data.job_id) window._lastJobId = data.job_id;   // for Step-5 continuation
+    const _history = document.getElementById('resultsHistory');
+    let _label, _accent;
+    if (withCorrect) {
+      window._step5Count = (window._step5Count || 0) + 1;
+      _label = 'Step 5 correction #' + window._step5Count;
+      _accent = true;
     } else {
-      // Step 4 (detection): single image; remember it for a later comparison.
-      resultImg.style.display = 'block';
-      resultImg.src = overlayUrl;
-      compareBox.style.display = 'none';
-      window._step4Overlay = overlayUrl;
+      window._step5Count = 0;
+      _history.innerHTML = '';   // new detection run: start a fresh history
+      _label = 'Run — detection';
+      _accent = false;
     }
+    const _pair = makeResultPair(_label, _accent);
+    _history.appendChild(_pair.wrap);
+    _pair.img.src = overlayUrl;
+    const _editUrl = data.edit_data_url ||
+      (data.job_id ? ('/result/' + data.job_id + '/edit_data.json') : null);
+    if (_editUrl) renderReconInto(_editUrl, _pair.canvas);
+    _pair.wrap.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     document.getElementById('downloadXlsx').href = data.xlsx_url;
     // Legend-fit diagnostic: available via a toggle button (open/close).
     const toggleDiag = document.getElementById('toggleDiag');
@@ -590,8 +675,10 @@ async function runDigitize(withCorrect) {
     // It re-runs with correction applied on top of the Step-4 result.
     const step5 = document.getElementById('btnStep5');
     if (step5) {
-      step5.style.display = (APP_MODE === 'bw') ? 'inline-block' : 'none';
+      step5.style.display = 'inline-block';   // both pipelines support Step 5
     }
+    const _ciWrap = document.getElementById('correctItersWrap');
+    if (_ciWrap) _ciWrap.style.display = 'inline-block';
   } catch (err) {
     alert('Failed: ' + err.message);
   } finally {
@@ -603,6 +690,10 @@ async function runDigitize(withCorrect) {
 }
 document.getElementById('run').addEventListener('click', () => runDigitize(false));
 document.getElementById('btnStep5').addEventListener('click', () => runDigitize(true));
+document.getElementById('clearHistory').addEventListener('click', () => {
+  document.getElementById('resultsHistory').innerHTML = '';
+  window._step5Count = 0;
+});
 
 /* ---------------- Human-assist point editor ---------------- */
 let ED = null;
@@ -868,6 +959,119 @@ function drawRecon(rows) {
   c.fillText(('' + (Math.round(xmax * 100) / 100)), M.l + W - 24, M.t + H + 12);
   c.fillText('' + (Math.round(ymax * 100) / 100), 2, M.t + 8);
   c.fillText('' + (Math.round(ymin * 100) / 100), 2, M.t + H);
+}
+
+// Standalone reconstruction render (no editor state) — draws edit_data points to
+// any canvas. Used to show a reconstructed plot beside the overlay after Run and
+// in the Step-5 comparison, without opening the point editor.
+function drawReconStandalone(rows, cv, imgW, imgH, cal, bounds) {
+  const c = cv.getContext('2d');
+  const rw = Math.max(360, Math.round((imgW || 600) * 0.6));
+  const rh = Math.max(240, Math.round((imgH || 400) * 0.6));
+  cv.width = rw; cv.height = rh;
+  c.fillStyle = '#fff'; c.fillRect(0, 0, cv.width, cv.height);
+  if (!rows || !rows.length) return;
+  const M = { l: 46, r: 12, t: 12, b: 30 };
+  const W = cv.width - M.l - M.r, H = cv.height - M.t - M.b;
+  const useData = !!cal;
+  let xs, ys, xlog = false, ylog = false;
+  if (useData) { xlog = cal.x.log; ylog = cal.y.log; xs = rows.map(r => r.dx); ys = rows.map(r => r.dy); }
+  else { xs = rows.map(r => r.px); ys = rows.map(r => -r.py); }
+  // Axis range: use the user-entered plot-area bounds (FIXED), not the detected
+  // point extent, so every reconstruction shows the same axes. Falls back to the
+  // point extent only when bounds are unusable (e.g. <=0 on a log axis).
+  let xmin, xmax, ymin, ymax;
+  if (bounds && useData) {
+    xmin = bounds.xmin; xmax = bounds.xmax; ymin = bounds.ymin; ymax = bounds.ymax;
+    if (xlog && (xmin <= 0 || xmax <= 0)) { const p = xs.filter(v => v > 0); xmin = Math.min(...p); xmax = Math.max(...p); }
+    if (ylog && (ymin <= 0 || ymax <= 0)) { const p = ys.filter(v => v > 0); ymin = Math.min(...p); ymax = Math.max(...p); }
+  } else {
+    xmin = Math.min(...xs); xmax = Math.max(...xs); ymin = Math.min(...ys); ymax = Math.max(...ys);
+  }
+  const fx = v => { let t; if (xlog) t = (Math.log10(v) - Math.log10(xmin)) / ((Math.log10(xmax) - Math.log10(xmin)) || 1); else t = (v - xmin) / ((xmax - xmin) || 1); return M.l + t * W; };
+  const fy = v => { let t; if (ylog) t = (Math.log10(v) - Math.log10(ymin)) / ((Math.log10(ymax) - Math.log10(ymin)) || 1); else t = (v - ymin) / ((ymax - ymin) || 1); return M.t + (1 - t) * H; };
+  c.strokeStyle = '#333'; c.lineWidth = 1;
+  c.beginPath(); c.moveTo(M.l, M.t); c.lineTo(M.l, M.t + H); c.lineTo(M.l + W, M.t + H); c.stroke();
+  const byLabel = {};
+  rows.forEach(r => { const k = r.name || r.label; (byLabel[k] = byLabel[k] || []).push(r); });
+  Object.values(byLabel).forEach(list => {
+    list.sort((a, b) => (useData ? a.dx - b.dx : a.px - b.px));
+    c.strokeStyle = rgbCss(list[0].rgb); c.fillStyle = rgbCss(list[0].rgb); c.lineWidth = 1.5;
+    c.beginPath();
+    list.forEach((r, i) => { const X = fx(useData ? r.dx : r.px), Y = fy(useData ? r.dy : -r.py); if (i === 0) c.moveTo(X, Y); else c.lineTo(X, Y); });
+    c.stroke();
+    list.forEach(r => { const X = fx(useData ? r.dx : r.px), Y = fy(useData ? r.dy : -r.py); c.beginPath(); c.arc(X, Y, 3, 0, 2 * Math.PI); c.fill(); });
+  });
+  c.fillStyle = '#333'; c.font = '10px sans-serif';
+  c.fillText('' + (Math.round(xmin * 100) / 100), M.l, M.t + H + 12);
+  c.fillText('' + (Math.round(xmax * 100) / 100), M.l + W - 24, M.t + H + 12);
+  c.fillText('' + (Math.round(ymax * 100) / 100), 2, M.t + 8);
+  c.fillText('' + (Math.round(ymin * 100) / 100), 2, M.t + H);
+}
+
+async function renderReconInto(editUrl, canvasEl) {
+  if (!editUrl || !canvasEl) return;
+  try {
+    const resp = await fetch(editUrl + '?t=' + Date.now());
+    const ed = await resp.json();
+    const cal = ed.calibration;
+    const rows = [];
+    (ed.curves || []).forEach(cv => {
+      const label = cv.label || cv.name;
+      const cname = cv.name || label;          // class name: stable grouping key
+      cv.points.slice().sort((a, b) => a.x - b.x).forEach(p => {
+        let dx = null, dy = null;
+        if (cal) { dx = pxToData(p.x, cal.x); dy = pxToData(p.y, cal.y); }
+        rows.push({ label, name: cname, rgb: cv.rgb, px: p.x, py: p.y, dx, dy });
+      });
+    });
+    const imgW = (ed.image && ed.image.width) || 600;
+    const imgH = (ed.image && ed.image.height) || 400;
+    // Fixed axis bounds. The calibration in edit_data.json already carries the
+    // real axis range (v0/v1 = the data values at the plot-area edges, whether
+    // they came from the typed values, the scale box or OCR), so prefer it.
+    // Only fall back to the typed fields, then to 0..1, when it is absent --
+    // defaulting to 0..1 on a log axis previously forced the renderer back to
+    // the point extent, which is why the axes looked wrong.
+    const _num = id => { const v = parseFloat(parseAxisValue(document.getElementById(id).value)); return isFinite(v) ? v : null; };
+    const _bx0 = _num('xMin'), _bx1 = _num('xMax'), _by0 = _num('yMin'), _by1 = _num('yMax');
+    const _rng = (ax, lo, hi, dLo, dHi) => (ax && isFinite(ax.v0) && isFinite(ax.v1))
+      ? [Math.min(ax.v0, ax.v1), Math.max(ax.v0, ax.v1)]
+      : [(lo !== null ? lo : dLo), (hi !== null ? hi : dHi)];
+    const _xr = _rng(cal && cal.x, _bx0, _bx1, 0, 1);
+    const _yr = _rng(cal && cal.y, _by0, _by1, 0, 1);
+    const bounds = { xmin: _xr[0], xmax: _xr[1], ymin: _yr[0], ymax: _yr[1] };
+    drawReconStandalone(rows, canvasEl, imgW, imgH, cal, bounds);
+  } catch (e) { console.error('recon render failed:', e); }
+}
+
+// Build a labelled pair block: [original + detected points] | [reconstructed plot].
+function makeResultPair(label, accent) {
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'margin-bottom:18px; padding-top:12px; border-top:1px solid var(--border);';
+  const title = document.createElement('div');
+  title.textContent = label;
+  title.style.cssText = 'font-size:13px; font-weight:700; margin-bottom:8px; color:' + (accent ? 'var(--accent)' : '#333') + ';';
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start;';
+  const col1 = document.createElement('div'); col1.style.cssText = 'flex:1; min-width:280px;';
+  const cap1 = document.createElement('div');
+  cap1.textContent = 'Original + detected points';
+  cap1.style.cssText = 'font-size:12px; font-weight:600; color:#6b6b6b; margin-bottom:4px;';
+  const img = document.createElement('img');
+  img.alt = 'data point overlay';
+  img.style.cssText = 'width:100%; border:1px solid var(--border); border-radius:8px;';
+  col1.appendChild(cap1); col1.appendChild(img);
+  const col2 = document.createElement('div'); col2.style.cssText = 'flex:1; min-width:280px;';
+  const cap2 = document.createElement('div');
+  cap2.textContent = 'Reconstructed plot';
+  cap2.style.cssText = 'font-size:12px; font-weight:600; color:' + (accent ? 'var(--accent)' : '#6b6b6b') + '; margin-bottom:4px;';
+  const canvas = document.createElement('canvas'); canvas.width = 600; canvas.height = 400;
+  canvas.style.cssText = 'width:100%; background:#fff; border:1px solid ' + (accent ? 'var(--accent)' : 'var(--border)') + '; border-radius:8px;';
+  col2.appendChild(cap2); col2.appendChild(canvas);
+  row.appendChild(col1); row.appendChild(col2);
+  wrap.appendChild(title); wrap.appendChild(row);
+  return { wrap, img, canvas };
 }
 
 function drawTable(rows) {

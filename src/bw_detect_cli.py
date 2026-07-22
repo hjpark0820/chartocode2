@@ -68,21 +68,52 @@ def main():
                     help="manual upscale factor; empty = auto-detect from legend")
     ap.add_argument("--correct", action="store_true",
                     help="run Step-5 SSIM greedy correction to refine points")
+    ap.add_argument("--correct-iters", default="",
+                    help="max number of Step-5 correction iterations (empty = default cap)")
+    ap.add_argument("--prev-state", default="",
+                    help="path to a previous correction_state.json; when given, Step-5 "
+                         "continues from that point set instead of re-detecting")
     a = ap.parse_args()
 
     os.makedirs(a.out_dir, exist_ok=True)
 
     # import torch FIRST, on this process's main thread, so its submodules
     # initialise cleanly before run_detection triggers `import torch` internally.
+    import time as _tmod
+    _t_imp0 = _tmod.perf_counter()
     try:
         import torch  # noqa: F401
-        print(f"[bw-cli] torch {torch.__version__} loaded")
+        _cuda = torch.cuda.is_available()
+        _dev = torch.cuda.get_device_name(0) if _cuda else "CPU"
+        print(f"[bw-cli] torch {torch.__version__} loaded  "
+              f"(cuda_available={_cuda}, device={_dev})")
+        if not _cuda and "+cpu" in torch.__version__:
+            print("[bw-cli] NOTE: this is a CPU-ONLY torch build (+cpu) — inference "
+                  "runs on CPU (slow). Install a CUDA build to use the GPU.")
     except Exception as e:
         print(f"[bw-cli] ERROR: torch not available: {e}")
         sys.exit(3)
 
     import bw_pipeline           # tkinter stub + run_detection
     import bw_to_edit_data
+    print(f"[bw-cli] [timing] imports (torch+pipeline): {_tmod.perf_counter()-_t_imp0:.2f}s")
+
+    # BUILD SIGNATURE — print key module paths + mtime/size so the ACTUAL deployed
+    # files can be verified (if a fix "does nothing", check these match your edits).
+    try:
+        import time as _tsig
+        _srcdir = os.path.dirname(os.path.abspath(__file__))
+        print("[bw-cli] BUILD SIGNATURE (src=%s):" % _srcdir)
+        for _sf in ('run_gui_v2.py', '2_point_detection_adaptive_nms_v2.py',
+                    '5_correction_v2.py', 'chart_marker_detector_v3.py'):
+            _p = os.path.join(_srcdir, _sf)
+            if os.path.exists(_p):
+                _mt = _tsig.strftime('%Y-%m-%d %H:%M', _tsig.localtime(os.path.getmtime(_p)))
+                print("[bw-cli]   %-38s mtime=%s size=%d" % (_sf, _mt, os.path.getsize(_p)))
+            else:
+                print("[bw-cli]   %-38s NOT FOUND" % _sf)
+    except Exception as _sige:
+        print("[bw-cli] BUILD SIGNATURE failed: %s" % _sige)
 
     img = cv2.imread(a.image)
     if img is None:
@@ -94,7 +125,23 @@ def main():
     kc = [c.strip() for c in a.classes.split(",") if c.strip()] or list(BW_ALL_CLASSES)
     eb = None if a.errorbars == "" else (a.errorbars.strip() in ("1", "true", "yes", "on"))
 
+    # Load a previous Step-5 state up front: when present the ViT detection is
+    # redundant (its points are replaced by the saved ones), so we skip it.
+    _prev_state = None
+    if a.correct and a.prev_state.strip() and os.path.exists(a.prev_state.strip()):
+        try:
+            with open(a.prev_state.strip(), "r", encoding="utf-8") as _pf:
+                _prev_state = json.load(_pf)
+            print(f"[bw-cli] prev-state loaded: "
+                  f"{len(_prev_state.get('P_current') or [])} active, "
+                  f"{len(_prev_state.get('S_current') or [])} suppressed")
+        except Exception as _pe:
+            print(f"[bw-cli] prev-state load failed ({_pe}); starting fresh")
+            _prev_state = None
+
+    _t_det0 = _tmod.perf_counter()
     result = bw_pipeline.run_detection(
+        skip_point_detection=bool(_prev_state),
         img_bgr=img, plot_area_px=pa, legend_area_px=_p4(a.legend_area),
         known_classes=kc, x_range=xr, y_range=yr,
         x_log=a.x_log, y_log=a.y_log, has_errorbars=eb,
@@ -102,6 +149,41 @@ def main():
         conf_thresh=(float(a.conf) if a.conf else None),
         stride=None, has_lines=True, log_fn=_safe_log,
     )
+    print(f"[bw-cli] [timing] run_detection total: {_tmod.perf_counter()-_t_det0:.2f}s")
+
+    def _write_state(_P, _S, _what, _mode_xs=None):
+        """Persist the point state (SCALED coords) so the next Step-5 continues
+        from exactly these points instead of re-detecting on its own."""
+        try:
+            def _plain(_pts):
+                out = []
+                for _p in (_pts or []):
+                    out.append({"cx": float(_p.get("cx", _p.get("cx_px", 0.0))),
+                                "cy": float(_p.get("cy", _p.get("cy_px", 0.0))),
+                                "class_name": str(_p.get("class_name", "")),
+                                "class_idx": int(_p.get("class_idx", 0))})
+                return out
+            _mx = _mode_xs
+            if _mx is None and _prev_state is not None:
+                _mx = _prev_state.get("mode_xs")
+            try:
+                _mx = [float(v) for v in (_mx if _mx is not None else [])]
+            except Exception:
+                _mx = []
+            with open(os.path.join(a.out_dir, "correction_state.json"), "w",
+                      encoding="utf-8") as _sf:
+                json.dump({"P_current": _plain(_P), "S_current": _plain(_S),
+                           "mode_xs": _mx}, _sf)
+            _safe_log(f"[bw-cli] saved correction_state.json from {_what} "
+                      f"({len(_P or [])} active, {len(_S or [])} suppressed)")
+        except Exception as _se:
+            _safe_log(f"[bw-cli] state save failed: {_se}")
+
+    # Save the DETECTION state too, so the first Step-5 press continues from the
+    # points the user just saw rather than starting from a fresh detection.
+    if not _prev_state:
+        _write_state(result.get("kept_scaled"), result.get("suppressed_scaled"),
+                     "detection", result.get("mode_xs"))
 
     # ── Optional Step-5 SSIM greedy correction: refine the point set ───────────
     if a.correct:
@@ -121,11 +203,28 @@ def main():
                 _tmp = _tf.name
             cv2.imwrite(_tmp, scaled if scaled is not None else img)
             _safe_log("[bw-cli] running Step-5 SSIM correction ...")
+            _t_corr0 = _tmod.perf_counter()
+            # Continue from a previous Step-5 result when one is supplied, so
+            # successive corrections compose instead of re-detecting from scratch.
+            _init_P = _prev_state.get("P_current") if _prev_state else None
+            _init_S = _prev_state.get("S_current") if _prev_state else None
+            _mode_xs = (_prev_state.get("mode_xs") if _prev_state else None) \
+                       or result.get("mode_xs")
+            if _prev_state:
+                _safe_log(f"[bw-cli] continuing from previous state: "
+                          f"{len(_init_P or [])} active, {len(_init_S or [])} suppressed")
             r5 = mod5.run_correction(
                 img_path=_tmp, model_path=model_path, detector_py_path=detector_py,
-                known_classes=kc, mode_xs=result.get("mode_xs"),
+                known_classes=kc, mode_xs=_mode_xs,
                 prep_info=result.get("prep_info"), return_diag_imgs=False,
+                max_iters=(int(a.correct_iters) if a.correct_iters.strip() else None),
+                d_override=result.get("d_override"),
+                init_points=_init_P, init_suppressed=_init_S,
             )
+            _safe_log(f"[bw-cli] [timing] correction total: "
+                      f"{_tmod.perf_counter() - _t_corr0:.2f}s")
+            # Persist the corrected state so the NEXT Step-5 can continue from it.
+            _write_state(r5.get("P_current"), r5.get("S_current"), "correction", _mode_xs)
             try:
                 os.unlink(_tmp)
             except Exception:
@@ -142,6 +241,31 @@ def main():
             if corrected:
                 result["detections"] = corrected
                 _safe_log(f"[bw-cli] Step-5 correction: {len(corrected)} active points")
+                # Redraw the overlay from the CORRECTED points so the overlay image
+                # (plot 2) matches edit_data.json / the live reconstruction (plot 3).
+                # Mirrors run_detection's Step-5 overlay style (same colours/sizes).
+                try:
+                    _MC = getattr(gui, "MARKER_COLORS", {})
+                    _ov2 = img.copy()
+                    cv2.rectangle(_ov2, (pa[0], pa[1]), (pa[2], pa[3]), (0, 200, 0), 2)
+                    _lg = _p4(a.legend_area)
+                    if _lg is not None:
+                        cv2.rectangle(_ov2, (_lg[0], _lg[1]), (_lg[2], _lg[3]), (200, 0, 200), 2)
+                    _ref = max(_ov2.shape[:2])
+                    _ro = max(4, int(_ref * 0.013)); _ri = max(2, int(_ro * 0.25))
+                    _fs = max(0.30, _ref * 0.00065); _th = max(1, int(_ref * 0.002))
+                    for _d in corrected:
+                        _cx = int(round(float(_d['cx_px']))); _cy = int(round(float(_d['cy_px'])))
+                        _c = _MC.get(_d['class_name'], (255, 0, 0)); _cbgr = (_c[2], _c[1], _c[0])
+                        cv2.circle(_ov2, (_cx, _cy), _ro, _cbgr, _th)
+                        cv2.circle(_ov2, (_cx, _cy), _ri, _cbgr, -1)
+                        _sh = _d['class_name'].replace('_marker', '').replace('_', ' ')
+                        cv2.putText(_ov2, _sh, (_cx + _ro + 2, _cy - 2),
+                                    cv2.FONT_HERSHEY_SIMPLEX, _fs, _cbgr, _th, cv2.LINE_AA)
+                    result["overlay_img"] = _ov2
+                    _safe_log("[bw-cli] overlay redrawn from corrected points (plot 2 = plot 3)")
+                except Exception as _oe:
+                    _safe_log("[bw-cli] overlay redraw failed: " + str(_oe))
             else:
                 _safe_log("[bw-cli] Step-5 produced no points; keeping raw detections")
         except Exception as _ce:

@@ -168,6 +168,7 @@ def run_detection(img_bgr: np.ndarray,
                   conf_thresh: float | None = None,
                   stride: int | None = None,
                   has_lines: bool = True,
+                  skip_point_detection: bool = False,
                   log_fn=print) -> dict:
     """
     Run the chartocode2 pipeline restricted to the user-specified areas.
@@ -183,6 +184,12 @@ def run_detection(img_bgr: np.ndarray,
     _orig_img_bgr      = img_bgr          # keep original for overlay
     _orig_plot_area_px = plot_area_px     # keep original for overlay
     _orig_legend_px    = legend_area_px   # keep original for overlay
+
+    # ── [point-diag] echo the user-specified areas so they can be verified ────
+    log_fn(f"[input] image {img_bgr.shape[1]}x{img_bgr.shape[0]}  "
+           f"plot_area(x0,y0,x1,y1)={tuple(int(v) for v in plot_area_px)}  "
+           f"legend_area={tuple(int(v) for v in legend_area_px) if legend_area_px else 'None'}  "
+           f"has_errorbars={has_errorbars}")
 
     # ── Upscale: auto-detect from legend if upscale=None ──────────────────────
     if upscale is None and legend_area_px is not None:
@@ -239,7 +246,46 @@ def run_detection(img_bgr: np.ndarray,
     _img_for_vit = img_bgr
     _prep_info_for_vit = prep_info
     _eb_info_list = []
+    _d_override_used = None   # d_est passed to NMS; shared with Step-5 correction for consistency
     _diag_steps: list[dict] = []  # list of {title, img_bgr}
+
+    # ── [input-diag] Visual confirmation of the areas the USER specified in the GUI,
+    #    overlaid on the ORIGINAL image with a PIXEL GRID so coordinates can be read off.
+    #    Green = plot area, Red = legend area. Uses original (unscaled) coordinates.
+    if os.environ.get("POINT_DIAG", "1") != "0":
+        try:
+            _in_diag = _orig_img_bgr.copy()
+            _Hd, _Wd = _in_diag.shape[:2]
+            # subtle pixel grid every 50 px (draw on overlay, then blend)
+            _grid = _in_diag.copy()
+            for _gx in range(0, _Wd, 50):
+                cv2.line(_grid, (_gx, 0), (_gx, _Hd), (235, 190, 100), 1)
+            for _gy in range(0, _Hd, 50):
+                cv2.line(_grid, (0, _gy), (_Wd, _gy), (235, 190, 100), 1)
+            cv2.addWeighted(_grid, 0.35, _in_diag, 0.65, 0, dst=_in_diag)
+            # coordinate labels every 100 px (top edge = x, left edge = y)
+            for _gx in range(0, _Wd, 100):
+                cv2.putText(_in_diag, str(_gx), (_gx + 2, 12), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.35, (200, 90, 0), 1, cv2.LINE_AA)
+            for _gy in range(0, _Hd, 100):
+                cv2.putText(_in_diag, str(_gy), (2, _gy + 12), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.35, (200, 90, 0), 1, cv2.LINE_AA)
+            # user-specified areas
+            _pa = tuple(int(v) for v in _orig_plot_area_px)
+            cv2.rectangle(_in_diag, (_pa[0], _pa[1]), (_pa[2], _pa[3]), (0, 200, 0), 2)
+            cv2.putText(_in_diag, f"plot area {_pa}", (_pa[0], max(14, _pa[1] - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 150, 0), 1, cv2.LINE_AA)
+            if _orig_legend_px is not None:
+                _lg = tuple(int(v) for v in _orig_legend_px)
+                cv2.rectangle(_in_diag, (_lg[0], _lg[1]), (_lg[2], _lg[3]), (0, 0, 230), 2)
+                cv2.putText(_in_diag, f"legend {_lg}", (_lg[0], max(14, _lg[1] - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 200), 1, cv2.LINE_AA)
+            _diag_steps.append({'title': 'Input — plot area (green) + legend (red) + pixel grid',
+                                'img_bgr': _in_diag})
+        except Exception as _ind_e:
+            log_fn(f"  [input-diag] area+grid overlay failed: {_ind_e}")
+
+
 
     if not has_lines:
         log_fn("[Step 1] No-lines mode: segment detection skipped.")
@@ -401,7 +447,11 @@ def run_detection(img_bgr: np.ndarray,
 
     # ── Stage 1 (ViT point detection) if model exists ────────────────────
     kept = []
-    if MODEL_PATH.exists() and known_classes:
+    if skip_point_detection:
+        # Step-5 continuing from a saved state: the ViT result would be thrown
+        # away anyway, so skip the expensive scan (this is the dominant cost).
+        log_fn("[Step 2] ViT detection SKIPPED (continuing from saved state).")
+    elif MODEL_PATH.exists() and known_classes:
         log_fn("[Step 2] ViT point detection (adaptive NMS) …")
         try:
             # Prefer _v2 version (supports prep_info); fall back to original
@@ -446,12 +496,14 @@ def run_detection(img_bgr: np.ndarray,
                         model_path       = str(MODEL_PATH),
                         known_classes    = known_classes,
                         detector_py_path = str(SRC_DIR / '1_point_detection_v3.py'),
+                        plot_area        = _orig_plot_area_px,
                     )
                     _os2.unlink(_tmp2)
                     _d_orig = _r_orig.get('d_est', None)
                     if _d_orig is not None:
                         _d_scaled = _d_orig * _upscale
                         call_kwargs['d_override'] = _d_scaled
+                        _d_override_used = _d_scaled
                         log_fn(f"  d_override={_d_scaled:.1f}px (orig d_est={_d_orig:.1f} x {_upscale})")
                 except Exception as _de:
                     log_fn(f"  d_override estimation failed: {_de}")
@@ -493,6 +545,49 @@ def run_detection(img_bgr: np.ndarray,
             os.unlink(tmp_path)
             kept = result2["kept"]
             log_fn(f"  {len(kept)} markers detected by ViT")
+            # ── [point-diag] Why were points dropped? (NMS is X-only) ──────────
+            if os.environ.get("POINT_DIAG", "1") != "0":
+                try:
+                    _sup  = result2.get("suppressed", [])
+                    _binw = result2.get("bin_width", 0) or 0
+                    # per-class kept vs suppressed summary (spot under-detected classes)
+                    from collections import Counter as _Cnt
+                    _kc = _Cnt(_kd.get("class_name", "?") for _kd in kept)
+                    _sc = _Cnt(_sd.get("original_class_name", _sd.get("class_name", "?")) for _sd in _sup)
+                    for _cn in sorted(set(_kc) | set(_sc)):
+                        _flag = "  <-- many suppressed" if _sc.get(_cn, 0) > _kc.get(_cn, 0) else ""
+                        log_fn(f"  [point-diag] class '{_cn}': kept={_kc.get(_cn,0)}, "
+                               f"suppressed={_sc.get(_cn,0)}{_flag}")
+                    log_fn(f"  [point-diag] raw ViT detections={len(kept)+len(_sup)} "
+                           f"(kept={len(kept)}, NMS-suppressed={len(_sup)}); "
+                           f"conf_thresh={conf_thresh if conf_thresh is not None else 'default'}, "
+                           f"nms_window={_binw:.0f}px")
+                    _stacked = 0
+                    for _sd in _sup:
+                        _scx, _scy = _sd.get("cx", -1), _sd.get("cy", -1)
+                        _scls = _sd.get("original_class_name", _sd.get("class_name", "?"))
+                        _sconf = _sd.get("confidence", 0.0)
+                        _cands = [(abs(_kd.get("cx", 1e9) - _scx), _kd) for _kd in kept
+                                  if _kd.get("class_name") == _scls]
+                        if _cands:
+                            _dx, _anc = min(_cands, key=lambda z: z[0])
+                            _dy = abs(_anc.get("cy", 0) - _scy)
+                            _same_x = _dx < max(3.0, _binw * 0.6) and _dy > 6
+                            _stacked += 1 if _same_x else 0
+                            log_fn(f"    [suppressed] {_scls} @({_scx:.0f},{_scy:.0f}) "
+                                   f"conf={_sconf:.2f} -> merged into kept "
+                                   f"({_anc.get('cx',0):.0f},{_anc.get('cy',0):.0f}) "
+                                   f"dx={_dx:.0f} dy={_dy:.0f}"
+                                   f"{'  [SAME-X STACKED]' if _same_x else ''}")
+                        else:
+                            log_fn(f"    [suppressed] {_scls} @({_scx:.0f},{_scy:.0f}) "
+                                   f"conf={_sconf:.2f} -> no same-class kept nearby")
+                    if _stacked:
+                        log_fn(f"  [point-diag] {_stacked} suppressed are SAME-X stacked: "
+                               f"NMS keeps one marker per class per x-window, so vertically-"
+                               f"stacked markers at ~same x are merged (not recoverable by ViT+NMS).")
+                except Exception as _pde:
+                    log_fn(f"  [point-diag] suppressed-diag failed: {_pde}")
             # Build ViT/NMS diagnostic image
             try:
                 import io as _io_vit
@@ -557,7 +652,27 @@ def run_detection(img_bgr: np.ndarray,
             if lx0 <= cx <= lx1 and ly0 <= cy <= ly1:
                 return False
         return True
-    kept_in = [d for d in kept if _in_plot_not_legend(d)]
+    kept_in, _filtered_out = [], []
+    for d in kept:
+        (kept_in if _in_plot_not_legend(d) else _filtered_out).append(d)
+    # Scaled-space detection state, handed to Step-5 so a correction continues
+    # from exactly the points shown here instead of re-detecting on its own.
+    # NOTE: deep-copy each dict — the scale-back loop below divides 'cx'/'cy'
+    # in place, which would otherwise rewrite this state into original coords.
+    _kept_scaled = [dict(d) for d in kept_in]
+    try:
+        _sup_scaled = [dict(d) for d in result2.get("suppressed", [])]
+    except Exception:
+        _sup_scaled = []
+    if _filtered_out and os.environ.get("POINT_DIAG", "1") != "0":
+        for d in _filtered_out:
+            cx = d.get('cx', d.get('cx_px', -1)); cy = d.get('cy', d.get('cy_px', -1))
+            _reason = "outside plot area"
+            if legend_area_px is not None:
+                lx0, ly0, lx1, ly1 = legend_area_px
+                if lx0 <= cx <= lx1 and ly0 <= cy <= ly1:
+                    _reason = "inside legend area"
+            log_fn(f"    [filtered] {d.get('class_name','?')} @({cx:.0f},{cy:.0f}) removed: {_reason}")
     log_fn(f"  {len(kept_in)} markers inside plot area (legend excluded)")
 
     # ── Scale coordinates back to original image space if scaled ───────────
@@ -592,6 +707,21 @@ def run_detection(img_bgr: np.ndarray,
 
     # Sort by x_data
     detections.sort(key=lambda d: d['x_data'])
+
+    # ── [point-diag] FINAL output points — exactly what the overlay/GUI shows.
+    #    Coordinates are ORIGINAL-image pixels (already scaled back), so they match
+    #    the overlay and any pixel grid drawn on the original image.
+    if os.environ.get("POINT_DIAG", "1") != "0":
+        try:
+            from collections import Counter as _Cnt2
+            _fc = _Cnt2(d['class_name'] for d in detections)
+            log_fn(f"  [final] {len(detections)} output points, by class: {dict(_fc)}")
+            for d in detections:
+                log_fn(f"    [final] {d['class_name']} @px({d['cx_px']:.0f},{d['cy_px']:.0f}) "
+                       f"data=({d['x_data']:.4g},{d['y_data']:.4g}) conf={d.get('confidence', 1.0):.2f}")
+        except Exception as _fde:
+            log_fn(f"  [final] final-points log failed: {_fde}")
+
 
     # ── Build overlay image (always on original-scale image) ────────────
     log_fn("[Step 5] Building overlay image …")
@@ -677,6 +807,9 @@ def run_detection(img_bgr: np.ndarray,
         'prep_info':     prep_info,
         'scaled_img_bgr': img_bgr,   # upscaled (or original if upscale=1) image
         'upscale':        _upscale,  # scale factor applied
+        'd_override':     _d_override_used,   # d_est used for NMS (for Step-5 correction consistency)
+        'kept_scaled':       _kept_scaled,     # detection state in SCALED coords (Step-5 handoff)
+        'suppressed_scaled': _sup_scaled,
     }
 
 

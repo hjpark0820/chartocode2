@@ -26,7 +26,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 
 HERE = Path(__file__).resolve().parent
 JOBS_ROOT = Path(tempfile.gettempdir()) / "unified_digitizer_jobs"
+SRC_DIR = Path(__file__).resolve().parent
 JOBS_ROOT.mkdir(exist_ok=True)
+
+# The colour pipeline's own post-detection outlier / fake-segment filters are
+# disabled: the Step-5 SSIM correction replaces them.  Flip this back to True to
+# restore the built-in filters (it just stops setting NO_OUTLIER_FILTER).
+COLOR_OUTLIER_FILTER = False
 
 app = FastAPI(title="Unified Chart Digitizer")
 
@@ -100,6 +106,8 @@ async def digitize(
     conf: str = Form(""),
     scale: str = Form(""),                     # "" = auto (from legend); else manual factor
     correct: str = Form(""),                   # "", "1" = run Step-5 SSIM correction
+    correct_iters: str = Form(""),             # "" = default cap; else max iteration count
+    prev_job: str = Form(""),                  # previous job id -> continue Step-5 from its state
 ):
     job_id = uuid.uuid4().hex[:12]
     job_dir = JOBS_ROOT / job_id
@@ -114,13 +122,15 @@ async def digitize(
     if mode == "bw":
         return _run_bw(job_id, in_path, out_dir, plot_area, legend_area,
                        known_classes, x_min, x_max, y_min, y_max, x_log, y_log,
-                       has_errorbars, conf, correct, scale)
+                       has_errorbars, conf, correct, scale, correct_iters, prev_job)
     return _run_color(job_id, in_path, out_dir, plot_area, legend_box,
-                      x_min, x_max, y_min, y_max, x_log, y_log)
+                      x_min, x_max, y_min, y_max, x_log, y_log,
+                      correct, correct_iters, prev_job)
 
 
 def _run_color(job_id, in_path, out_dir, plot_area, legend_box,
-               x_min, x_max, y_min, y_max, x_log, y_log):
+               x_min, x_max, y_min, y_max, x_log, y_log,
+               correct="", correct_iters="", prev_job=""):
     pipeline = _pick_color_pipeline()
     if pipeline is None:
         raise HTTPException(500, "no run_A4_auto_v<N>.py found (set PLOT_PIPELINE)")
@@ -133,13 +143,40 @@ def _run_color(job_id, in_path, out_dir, plot_area, legend_box,
     if y_max.strip():      cmd += ["--y-max", y_max.strip()]
     if _truthy(x_log):     cmd += ["--x-log"]
     if _truthy(y_log):     cmd += ["--y-log"]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    _env = os.environ.copy()
+    if not COLOR_OUTLIER_FILTER:
+        _env["NO_OUTLIER_FILTER"] = "1"
+    print(f"[unified] colour job: correct={correct!r} iters={correct_iters!r} "
+          f"prev_job={prev_job!r}  outlier_filter="
+          f"{'ON' if COLOR_OUTLIER_FILTER else 'OFF (replaced by Step-5)'}", flush=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=_env)
     _log = (proc.stdout or "") + (proc.stderr or "")
     # Surface the pipeline's own stdout (incl. DEBUG_LABELS [labels] lines) to the
     # server console. capture_output=True otherwise swallows it into the buffer, so
     # nothing prints in the terminal even when DEBUG_LABELS=1 is set.
     print(_log, flush=True)
     ok = (out_dir / "edit_data.json").exists()
+
+    # Step-5 SSIM correction (colour): post-process, the pipeline itself is
+    # untouched. Mirrors the B&W flow, including continuing from a previous run.
+    if not _truthy(correct):
+        print("[unified] colour Step-5 not requested (correct not set)", flush=True)
+    if ok and _truthy(correct):
+        ccmd = [sys.executable, str(SRC_DIR / "color_correct_cli.py"),
+                str(in_path), str(out_dir)]
+        if plot_area.strip():    ccmd += ["--plot-area", plot_area.strip()]
+        if legend_box.strip():   ccmd += ["--legend-area", legend_box.strip()]
+        if correct_iters.strip():ccmd += ["--correct-iters", correct_iters.strip()]
+        if prev_job.strip():
+            _prev = JOBS_ROOT / prev_job.strip() / "out" / "color_correction_state.json"
+            if _prev.exists():
+                ccmd += ["--prev-state", str(_prev)]
+        print("[unified] colour Step-5:", " ".join(ccmd), flush=True)
+        cproc = subprocess.run(ccmd, capture_output=True, text=True, timeout=900)
+        _clog = (cproc.stdout or "") + (cproc.stderr or "")
+        print(_clog, flush=True)
+        _log += "\n---- colour Step-5 ----\n" + _clog
+
     return _response(job_id, out_dir, "color", ok, _log)
 
 
@@ -155,7 +192,7 @@ BW_ALL_CLASSES = [
 
 def _run_bw(job_id, in_path, out_dir, plot_area, legend_area, known_classes,
             x_min, x_max, y_min, y_max, x_log, y_log, has_errorbars, conf,
-            correct="", scale=""):
+            correct="", scale="", correct_iters="", prev_job=""):
     """Run B&W detection in a SEPARATE process (main thread) via bw_detect_cli.py,
     mirroring the colour path. This is what fixes the torch circular-import: torch
     is imported on that process's main thread, exactly like the standalone GUI,
@@ -177,6 +214,12 @@ def _run_bw(job_id, in_path, out_dir, plot_area, legend_area, known_classes,
     if has_errorbars != "":   cmd += ["--errorbars", "1" if _truthy(has_errorbars) else "0"]
     if scale.strip():         cmd += ["--scale", scale.strip()]
     if _truthy(correct):      cmd += ["--correct"]
+    if correct_iters.strip(): cmd += ["--correct-iters", correct_iters.strip()]
+    if prev_job.strip():
+        # continue Step-5 from the previous job's saved correction state
+        _prev = JOBS_ROOT / prev_job.strip() / "out" / "correction_state.json"
+        if _prev.exists():
+            cmd += ["--prev-state", str(_prev)]
 
     print("[unified] BW subprocess:", " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True,

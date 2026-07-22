@@ -1,4 +1,17 @@
-"""
+"""COLOUR copy of the Step-5 SSIM correction (5_correction_v2.py).
+
+Loaded by color_step5.py so the colour pipeline can be developed without
+touching the black-and-white module that is already deployed.  Differences
+from 5_correction_v2.py:
+  * CLASS_NAMES is a plain constant, so no ViT/torch import is needed
+  * the detector / adaptive-NMS modules load only when a detection is run
+    (with init_points supplied the correction is detector-free)
+  * RENDER_LW lets the caller match the plot's stroke width
+  * the [ssim-repro] block runs after I0 exists (it silently failed before)
+Everything else -- the greedy, the two l* strategies, the cascade actions,
+the removal cost -- is identical.
+
+
 5_correction.py
 ===============
 Stage 4: Greedy SSIM-based correction pipeline with suppressed-point activation.
@@ -101,6 +114,15 @@ MIN_GAIN_PER_REMOVAL = 0.002
                           # real points deleted for a total gain of 0.0014).
                            # (overridden at runtime to grid_step * 0.5)
 RENDER_MARKER_PT = 5.0    # marker size (pt) for rendered plots
+# Marker class order. Must match chart_marker_detector_v3.CLASS_NAMES; kept as a
+# plain constant so the correction can run WITHOUT the ViT detector (e.g. driven by
+# the colour pipeline, which supplies its own points).
+CLASS_NAMES = [
+    'filled_circle', 'open_circle', 'filled_square', 'open_square',
+    'open_triangle', 'open_inv_triangle', 'filled_triangle', 'filled_inv_triangle',
+    'open_rhombus', 'filled_rhombus', 'x_marker', 'plus_marker',
+]
+
 TRY_BOTH_STRATEGIES = True
                           # Evaluate BOTH l* strategies every iteration and keep
                           # the better one. Previously the extra-ink (old) search
@@ -282,7 +304,7 @@ def _eval_perturbs_batched(valid_perturbs, eval_fn, current_best_d,
 
     Returns
     -------
-    (best_d, best_P, best_action)  — best found, or (current_best_d, None, None)
+    (best_d, best_P, best_action)  -- best found, or (current_best_d, None, None)
     if no improvement was found.
     """
     if not valid_perturbs:
@@ -403,10 +425,15 @@ def save_ssim_residual(I0, points, out_dir, tag, dist=None, plot_area=None):
 # ---------------------------------------------------------------------------
 
 # Marker radius in pixels for the rendered image (RENDER_MARKER_PT is in pt
-# units; at DPI=100 one pt ≈ 1.39 px, so 5 pt ≈ 7 px radius).
+# units; at DPI=100 one pt ~ 1.39 px, so 5 pt ~ 7 px radius).
 _CV_MARKER_R = 4   # half-size in px for cv2 marker drawing
+RENDER_LW    = 1   # default polyline width used by render_from_points.
+                   # Callers driving the correction on a plot whose strokes are
+                   # thicker (e.g. the colour pipeline) should set this to match,
+                   # otherwise every segment carries a constant residual and the
+                   # greedy "improves" SSIM by deleting points.
 
-# Map class index → (shape_type, filled)
+# Map class index -> (shape_type, filled)
 #   shape_type: 'circle', 'square', 'triangle_up', 'triangle_down',
 #               'rhombus', 'x', 'plus'
 _CV_SHAPE = [
@@ -500,7 +527,7 @@ def _cv_draw_marker(img, cx, cy, class_idx, r=_CV_MARKER_R):
         cv2.line(img, (cx, cy - r), (cx, cy + r), BLACK, lw + 1)
 
 
-def render_from_points(points, pa_shape, linewidth=1.0):
+def render_from_points(points, pa_shape, linewidth=None):
     """
     Render a synthetic chart image from a list of active point dicts.
     Uses OpenCV for fast rendering (replaces matplotlib, ~5-10x speedup).
@@ -519,6 +546,8 @@ def render_from_points(points, pa_shape, linewidth=1.0):
     -------
     BGR numpy array of shape (H, W, 3).
     """
+    if linewidth is None:
+        linewidth = RENDER_LW
     H_pa, W_pa = pa_shape
     img = np.full((H_pa, W_pa, 3), 255, dtype=np.uint8)  # white background
 
@@ -637,16 +666,26 @@ def count_new_conflicts(P_baseline, P_new, x_approx):
 # Post-perturbation sliding-window NMS
 # ---------------------------------------------------------------------------
 
-def post_perturbation_nms(P, S, window):
+NMS_VERTICAL_KEEP = 0.0
+"""Two same-class points closer than `window` in x are normally merged.  When
+this is > 0, a pair separated by MORE than this many pixels in y is kept
+instead: a curve that rises vertically (a re-dose spike) legitimately has two
+points -- the trough and the peak -- at the same x, and x-only NMS would destroy
+one of them.  The colour driver sets it from the measured marker size."""
+
+
+def post_perturbation_nms(P, S, window, vertical_keep=None):
     """Apply sliding-window NMS to P after a perturbation.
 
     For each class, sort active points by cx.  Sweep with a sliding window
     of width `window`.  When two same-class points fall within the window,
     keep the one with higher confidence (ties broken randomly); move the
-    other to S.
+    other to S -- unless they are far enough apart in y (see
+    NMS_VERTICAL_KEEP), in which case both survive.
 
     Returns (P_clean, S_updated).
     """
+    _vk = NMS_VERTICAL_KEEP if vertical_keep is None else vertical_keep
     active  = [p for p in P if p.get('class_name') != 'suppressed']
     by_cls  = defaultdict(list)
     for p in active:
@@ -665,6 +704,8 @@ def post_perturbation_nms(P, S, window):
                     break
                 if id(other) in suppressed_ids:
                     continue
+                if _vk > 0 and abs(other['cy'] - anchor['cy']) > _vk:
+                    continue          # vertical rise: keep both trough and peak
                 # Within window -- suppress the weaker one
                 a_conf = anchor.get('confidence', 0.0)
                 o_conf = other.get('confidence', 0.0)
@@ -704,7 +745,10 @@ def generate_perturbations(P, sup_near, cand_locs, symbol_set):
     -------
     list of (action_str, P_tilde) tuples
     """
-    from chart_marker_detector_v3 import CLASS_NAMES as _CN
+    try:                       # prefer the detector's list when it is importable
+        from chart_marker_detector_v3 import CLASS_NAMES as _CN
+    except Exception:          # colour pipeline / no-torch use
+        _CN = CLASS_NAMES
 
     perturbations = []
 
@@ -716,7 +760,7 @@ def generate_perturbations(P, sup_near, cand_locs, symbol_set):
              if math.hypot(p['cx'] - cx, p['cy'] - cy) <= PT_TOL
              and p['class_name'] != 'suppressed']
 
-        # ── Cascade tail ─────────────────────────────────────────────────────
+        # -- Cascade tail -----------------------------------------------------
         # With points 1-2-3-4-5 on one curve and l* = 3-4, acting on point 3
         # alone can be misleading: deleting 3's neighbour 2 would join 1--3 and
         # wreck the SSIM, so greedy prefers deleting the REAL point 3 instead of
@@ -993,7 +1037,7 @@ def run_one_iteration(P_in, S_in, I0, L_refined, known_classes,
                 seen_sup.add(id(best_sup))
 
         all_perturbs   = generate_perturbations(P_in, sup_near, cand_locs, known_classes)
-        # (B) Cache baseline conflict pairs once — avoids O(n²) recompute per perturbation
+        # (B) Cache baseline conflict pairs once -- avoids O(n^2) recompute per perturbation
         _baseline_pairs = _conflict_pairs_cached(P_in, X_APPROX)
         # Also filter out any ADD/ACTIVATE result whose new point lands in legend
         valid_perturbs = [
@@ -1070,7 +1114,7 @@ def run_one_iteration(P_in, S_in, I0, L_refined, known_classes,
 
             all_perturbs2   = generate_perturbations(P_in, sup_near2, cand_locs2, known_classes)
             # (B) Reuse cached baseline pairs (computed once above, or compute here if
-            #     current strategy was skipped — use try/except for safe local var check)
+            #     current strategy was skipped -- use try/except for safe local var check)
             try:
                 _baseline_pairs
             except NameError:
@@ -1454,7 +1498,9 @@ def run_pipeline(plot_name, img_path, out_dir,
                  max_iters=None,
                  d_override=None,
                  init_points=None,
-                 init_suppressed=None):
+                 init_suppressed=None,
+                 segments_override=None,
+                 grid_xs_override=None):
     """
     Run the full 4-stage pipeline for a single chart image.
 
@@ -1491,8 +1537,11 @@ def run_pipeline(plot_name, img_path, out_dir,
     print(f"  Plot: {plot_name}")
     print(f"{'='*65}")
 
-    # Load detector module
-    _load_module('chart_marker_detector_v3', detector_py_path)
+    # Load detector module (only needed when we actually run a detection; with
+    # init_points supplied the correction is detector-free, which lets the colour
+    # pipeline drive it without torch).
+    if init_points is None and detector_py_path:
+        _load_module('chart_marker_detector_v3', detector_py_path)
 
     # Add deliverable directory to path so sibling modules are importable
     _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1508,12 +1557,15 @@ def run_pipeline(plot_name, img_path, out_dir,
     refine        = _refine_mod.refine
     grid_step     = _refine_mod.grid_step
 
-    # Stage 1b: adaptive NMS detection
-    _adnms_path = os.path.join(_this_dir, '2_point_detection_adaptive_nms_v2.py')
-    _adnms_mod  = _load_module('adaptive_nms_detection_v2', _adnms_path)
-    detect_with_adaptive_nms = _adnms_mod.detect_with_adaptive_nms
+    # Stage 1b: adaptive NMS detection (skipped entirely when continuing from a
+    # supplied point set -- keeps this module importable without torch)
+    detect_with_adaptive_nms = None
+    if init_points is None:
+        _adnms_path = os.path.join(_this_dir, '2_point_detection_adaptive_nms_v2.py')
+        _adnms_mod  = _load_module('adaptive_nms_detection_v2', _adnms_path)
+        detect_with_adaptive_nms = _adnms_mod.detect_with_adaptive_nms
 
-    # ── Preprocessing: run if not already done externally ─────────────────
+    # -- Preprocessing: run if not already done externally -----------------
     # If prep_info was passed from pipeline.py, reuse it.
     # Otherwise, try to run preprocessing here (for standalone Stage 4 use).
     if prep_info is None:
@@ -1554,10 +1606,10 @@ def run_pipeline(plot_name, img_path, out_dir,
         else:
             mode_xs = np.asarray(mode_xs)
 
-    # ── Legend-area exclusion: remove any point inside the legend box ──────
+    # -- Legend-area exclusion: remove any point inside the legend box ------
     _legend_box = prep_info.get('legend_box', None) if prep_info else None
     if _legend_box is not None:
-        print(f'  legend_box = {_legend_box}  → filtering P0 and S0')
+        print(f'  legend_box = {_legend_box}  -> filtering P0 and S0')
         P0 = _filter_legend(P0, _legend_box)
         S0 = _filter_legend(S0, _legend_box)
     # Constrain to the plot area too: drop any detection outside it (axis labels,
@@ -1568,7 +1620,7 @@ def run_pipeline(plot_name, img_path, out_dir,
     if prep_info:
         _plot_area_f = prep_info.get('user_plot_area', None) or prep_info.get('plot_area', None)
     if _plot_area_f is not None:
-        print(f'  plot_area = {_plot_area_f}  → filtering P0 and S0 to inside')
+        print(f'  plot_area = {_plot_area_f}  -> filtering P0 and S0 to inside')
         P0 = _filter_plot_area(P0, _plot_area_f)
         S0 = _filter_plot_area(S0, _plot_area_f)
     # Restrict ALL SSIM comparisons to the plot area so out-of-plot border/text
@@ -1579,18 +1631,6 @@ def run_pipeline(plot_name, img_path, out_dir,
         print(f'  [correction] SSIM restricted to plot area {_plot_area_f}')
     # Store for use in run_one_iteration candidate filtering
     _LEGEND_BOX = _legend_box
-
-    # ── [ssim-repro] Save the exact SSIM reference (cleaned I0) + the recipe, so
-    #    any point set's 1-SSIM can be reproduced offline from the logged points.
-    try:
-        cv2.imwrite(os.path.join(out_dir, 'ssim_reference_I0.png'), I0)
-        print(f"  [ssim-repro] saved ssim_reference_I0.png  (H={H}, W={W})")
-        print(f"  [ssim-repro] recipe: render points on WHITE ({H}x{W}); per class_idx draw a "
-              f"BLACK polyline through points sorted by cx (cv2.line, lw=1), then markers; "
-              f"crop BOTH render and I0 to plot_area={_SSIM_CROP}; to grayscale/255.0; "
-              f"1-SSIM = 1 - structural_similarity(I0_crop, render_crop, data_range=1.0)")
-    except Exception as _re:
-        print(f"  [ssim-repro] reference save failed: {_re}")
 
     cnt = {k: sum(1 for d in P0 if d['class_name'] == k) for k in known_classes}
     print(f"  P0 (active):     {len(P0)} pts  "
@@ -1618,16 +1658,40 @@ def run_pipeline(plot_name, img_path, out_dir,
     H, W   = I0.shape[:2]
     I0_rgb = cv2.cvtColor(I0, cv2.COLOR_BGR2RGB)
 
+    # -- [ssim-repro] Save the exact SSIM reference (cleaned I0) + the recipe, so
+    #    any point set's 1-SSIM can be reproduced offline from the logged points.
+    try:
+        cv2.imwrite(os.path.join(out_dir, 'ssim_reference_I0.png'), I0)
+        print(f"  [ssim-repro] saved ssim_reference_I0.png  (H={H}, W={W})")
+        print(f"  [ssim-repro] recipe: render points on WHITE ({H}x{W}); per class_idx draw a "
+              f"BLACK polyline through points sorted by cx (cv2.line, lw=1), then markers; "
+              f"crop BOTH render and I0 to plot_area={_SSIM_CROP}; to grayscale/255.0; "
+              f"1-SSIM = 1 - structural_similarity(I0_crop, render_crop, data_range=1.0)")
+    except Exception as _re:
+        print(f"  [ssim-repro] reference save failed: {_re}")
+
+
     import time as _ctime
     _t_seg0 = _ctime.perf_counter()
     print('  Detecting & refining segments ...')
     # Pass prep_info so Stage 2 removes axis/legend/text noise from I0.
     # Note: detect_debug is called WITHOUT prep_info inside run_one_iteration
     # (for synthetic renders I_t), which is correct -- they are already clean.
-    seg_result = detect_debug(I0, prep_info=prep_info)
-    L0_raw     = seg_result['segments']
+    if segments_override is not None:
+        # Caller-supplied segment set. The colour driver builds this from BOTH
+        # the whole plot read as greyscale (complete line geometry, even where a
+        # colour mask is fragmentary) and the curve's own colour mask.
+        L0_raw = list(segments_override)
+        print(f'  [segments] using {len(L0_raw)} caller-supplied segments '
+              f'(detect_debug on I0 skipped)')
+    else:
+        seg_result = detect_debug(I0, prep_info=prep_info)
+        L0_raw     = seg_result['segments']
 
-    if mode_xs is not None and len(mode_xs) >= 2:
+    if grid_xs_override is not None and len(grid_xs_override) >= 2:
+        grid_xs = list(grid_xs_override)
+        print(f'  [grid] using {len(grid_xs)} caller-supplied x columns')
+    elif mode_xs is not None and len(mode_xs) >= 2:
         grid_xs = list(mode_xs)
     else:
         grid_xs = infer_x_grid(P0)
@@ -1647,7 +1711,7 @@ def run_pipeline(plot_name, img_path, out_dir,
     initial_dist = ssim_dist(I0, I_init)
     print(f"  Initial 1-SSIM: {initial_dist:.5f}")
 
-    # ── [ssim-repro] initial active set (P0) + full suppressed pool (S0) with
+    # -- [ssim-repro] initial active set (P0) + full suppressed pool (S0) with
     #    symbol + coords. Together with ssim_reference_I0.png and the per-iteration
     #    [state-active] logs, ANY alternative action's 1-SSIM can be recomputed offline.
     def _fmt0(_d):
@@ -1691,7 +1755,7 @@ def run_pipeline(plot_name, img_path, out_dir,
               f"1-SSIM={state['best_dist']:.5f}  "
               f"({'improved' if state['improved'] else 'no improvement'})")
 
-        # ── Detailed action + candidate trace (symbol + coords) for offline analysis ──
+        # -- Detailed action + candidate trace (symbol + coords) for offline analysis --
         def _fmt(_d):
             return f"{_d.get('class_name','?')}@({_d.get('cx',-1):.0f},{_d.get('cy',-1):.0f})"
         for _a in state.get('added', []):
@@ -1712,7 +1776,7 @@ def run_pipeline(plot_name, img_path, out_dir,
                 print(f"    [l-star] ({_lx0:.0f},{_ly0:.0f})-({_lx1:.0f},{_ly1:.0f})  strat={state.get('l_star_strategy','?')}")
             except Exception:
                 pass
-        # full ACTIVE set after this iteration — lets any alternative be reproduced offline
+        # full ACTIVE set after this iteration -- lets any alternative be reproduced offline
         print(f"    [state-active iter{t} n={len(state['P_out'])}] " +
               "; ".join(_fmt(d) for d in state['P_out']))
 
@@ -1727,7 +1791,7 @@ def run_pipeline(plot_name, img_path, out_dir,
         if return_diag_imgs and _iter_img is not None:
             act_str = state['action']
             diag_imgs.append({
-                'title': (f'Stage 5 — Iter {t}  [{act_str}]  '
+                'title': (f'Stage 5 -- Iter {t}  [{act_str}]  '
                           f'1-SSIM={state["best_dist"]:.4f}  '
                           f'({"improved" if state["improved"] else "no improvement"})'),
                 'img_bgr': _iter_img,
@@ -1780,7 +1844,8 @@ def run_pipeline(plot_name, img_path, out_dir,
 def run_correction(img_path, model_path, detector_py_path,
                    known_classes=None, out_dir=None, mode_xs=None,
                    prep_info=None, return_diag_imgs=False, max_iters=None,
-                   d_override=None, init_points=None, init_suppressed=None):
+                   d_override=None, init_points=None, init_suppressed=None,
+                   segments_override=None, grid_xs_override=None):
     """
     Convenience wrapper that runs the full pipeline on a single image.
 
@@ -1818,8 +1883,10 @@ def run_correction(img_path, model_path, detector_py_path,
         return_diag_imgs = return_diag_imgs,
         max_iters        = max_iters,
         d_override       = d_override,
-        init_points      = init_points,
-        init_suppressed  = init_suppressed,
+        init_points       = init_points,
+        init_suppressed   = init_suppressed,
+        segments_override = segments_override,
+        grid_xs_override  = grid_xs_override,
     )
     if return_diag_imgs:
         history, diag_imgs, P_current, S_current = result
