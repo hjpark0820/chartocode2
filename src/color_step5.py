@@ -45,6 +45,11 @@ import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
+# Two proposals closer than this are the same data point (px).  Used to merge
+# template-matched markers with supplied points and to drop suppressed
+# proposals that duplicate an active point.
+PT_MERGE_TOL = 12.0
+
 
 # ---------------------------------------------------------------------------
 # Step-5 module loader (file name starts with a digit -> import by path)
@@ -307,6 +312,407 @@ def _segments_off_stems(segments, stems_mask: np.ndarray, frac: float = 0.5) -> 
     return out
 
 
+def chart_furniture_mask(img_bgr, plot_area, span_frac=0.50, max_thick=4,
+                         marker_extent=6, blob_area=260):
+    """Mask the chart's own lines: axes, gridlines and reference lines (LLOQ).
+
+    These are drawn in black/grey, so an achromatic curve's tube claims them and
+    markers get "found" strung along the x-axis or the LLOQ rule.  Furniture is
+    told apart from a genuinely flat data curve by thickness alone: a rule is
+    thin along its whole length, while a data curve carries markers, so some
+    columns are much thicker than the line itself.
+
+    A row (or column) qualifies when it is dark across most of the plot, its
+    contiguous band is at most `max_thick` px, and nowhere in the band does the
+    ink swell to `marker_extent` px -- i.e. it never carries a marker.
+    """
+    x0, y0, x1, y1 = [int(v) for v in plot_area]
+    H, W = img_bgr.shape[:2]
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(W - 1, x1), min(H - 1, y1)
+    g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    dark = np.zeros((H, W), bool)
+    dark[y0:y1 + 1, x0:x1 + 1] = g[y0:y1 + 1, x0:x1 + 1] < 170
+    out = np.zeros((H, W), bool)
+
+    def _bands(counts, need, lo, hi):
+        hits = [i for i, c in enumerate(counts) if c >= need]
+        groups, cur = [], []
+        for i in hits:
+            if cur and i == cur[-1] + 1:
+                cur.append(i)
+            else:
+                if cur:
+                    groups.append(cur)
+                cur = [i]
+        if cur:
+            groups.append(cur)
+        return [(lo + gp[0], lo + gp[-1]) for gp in groups
+                if len(gp) <= max_thick and lo + gp[-1] <= hi]
+
+    # A rule's anti-aliased fringe is lighter than the core, so the core band is
+    # grown outwards while the neighbouring row/column is still mostly ink --
+    # otherwise the fringe survives and carries detections along the axis.
+    soft = np.zeros((H, W), bool)
+    soft[y0:y1 + 1, x0:x1 + 1] = g[y0:y1 + 1, x0:x1 + 1] < 215
+
+    def _grow_rows(a, b):
+        while a - 1 >= y0 and soft[a - 1, x0:x1 + 1].sum() >= need_h:
+            a -= 1
+        while b + 1 <= y1 and soft[b + 1, x0:x1 + 1].sum() >= need_h:
+            b += 1
+        return a, b
+
+    def _grow_cols(a, b):
+        while a - 1 >= x0 and soft[y0:y1 + 1, a - 1].sum() >= need_v:
+            a -= 1
+        while b + 1 <= x1 and soft[y0:y1 + 1, b + 1].sum() >= need_v:
+            b += 1
+        return a, b
+
+    # horizontal rules (x-axis, LLOQ, gridlines)
+    need_h = span_frac * (x1 - x0 + 1)
+    need_v = span_frac * (y1 - y0 + 1)
+    counts = [int(dark[y, x0:x1 + 1].sum()) for y in range(y0, y1 + 1)]
+    for by0, by1 in _bands(counts, need_h, y0, y1):
+        pad = marker_extent
+        band = dark[max(y0, by0 - pad):min(y1 + 1, by1 + 1 + pad), x0:x1 + 1]
+        ext = np.array([(np.ptp(np.nonzero(band[:, c])[0]) + 1) if band[:, c].any() else 0
+                        for c in range(band.shape[1])])
+        # A rule stays thin along its length; a flat data curve swells at every
+        # marker, so the typical (median) column is what separates them.
+        if ext.size and float(np.median(ext[ext > 0])) < marker_extent:
+            by0, by1 = _grow_rows(by0, by1)
+            out[by0:by1 + 1, x0:x1 + 1] = True
+
+    # vertical rules (y-axis, gridlines)
+    counts = [int(dark[y0:y1 + 1, x].sum()) for x in range(x0, x1 + 1)]
+    for bx0, bx1 in _bands(counts, need_v, x0, x1):
+        pad = marker_extent
+        band = dark[y0:y1 + 1, max(x0, bx0 - pad):min(x1 + 1, bx1 + 1 + pad)]
+        ext = np.array([(np.ptp(np.nonzero(band[r, :])[0]) + 1) if band[r, :].any() else 0
+                        for r in range(band.shape[0])])
+        if ext.size and float(np.median(ext[ext > 0])) < marker_extent:
+            bx0, bx1 = _grow_cols(bx0, bx1)
+            out[y0:y1 + 1, bx0:bx1 + 1] = True
+
+    # A rule's dashes and its label ("LLOQ = ...") sit on the band and are dark,
+    # so they are claimed by an achromatic curve and match as markers. They are
+    # small isolated blobs; a real curve crossing the rule is a large component
+    # and survives.
+    if out.any():
+        n_lab, lab, st, _ct = cv2.connectedComponentsWithStats(
+            dark.astype(np.uint8), 8)
+        for k in range(1, n_lab):
+            if st[k, cv2.CC_STAT_AREA] > blob_area:
+                continue
+            comp = lab == k
+            if (comp & out).any():
+                out |= comp
+    return out
+
+
+def _tube_dist(sub_rgb, swatch_rgb):
+    """Distance of each pixel to the swatch->white blend line."""
+    s = np.asarray(swatch_rgb, np.float64)
+    d = np.array([255.0, 255.0, 255.0]) - s
+    den = float(d @ d) or 1.0
+    t = np.clip(((sub_rgb - s) @ d) / den, 0.0, 1.0)
+    return np.linalg.norm(sub_rgb - (s + t[..., None] * d), axis=-1)
+
+
+def swatch_marker_template(img_bgr, swatch_box, swatch_rgb, tol=46.0,
+                           other_swatches=None):
+    """Cut the MARKER shape out of a curve's legend swatch, as a binary patch.
+
+    A swatch is usually a line with a marker on it (--o--).  The marker is the
+    part with a large VERTICAL EXTENT; the connecting line is thin and spans the
+    whole swatch, so per-column extent separates them without eroding open
+    markers (a ring/hollow triangle survives, which morphological opening would
+    destroy).  Error bars are excluded by capping the marker's height to roughly
+    its width -- markers are compact, error bars are tall and thin.
+
+    Returns a float32 binary patch usable as a matchTemplate template, or None
+    when the swatch carries no marker (line-only legend entry).
+    """
+    x0, y0, x1, y1 = [int(v) for v in swatch_box]
+    H, W = img_bgr.shape[:2]
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(W, x1), min(H, y1)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    sub = img_bgr[y0:y1, x0:x1, ::-1].astype(np.float64)
+    dist = _tube_dist(sub, swatch_rgb)
+    ink = (dist <= tol) & (sub.min(axis=-1) < 244)
+    # Keep only pixels this swatch owns.  Without it the grey/neighbouring
+    # pixels of the connecting line join the template and widen it into a bar.
+    for o in (other_swatches or []):
+        if np.array_equal(np.asarray(o), np.asarray(swatch_rgb)):
+            continue
+        ink &= dist <= _tube_dist(sub, o)
+    if ink.sum() < 20:
+        return None
+
+    ext = np.array([(np.ptp(np.nonzero(ink[:, c])[0]) + 1) if ink[:, c].any() else 0
+                    for c in range(ink.shape[1])])
+    if ext.max() < 5:
+        return None                       # thin everywhere -> line-only swatch
+    # Marker columns: tall in absolute terms (the validated swatch rule) and
+    # tall relative to this swatch, which separates the marker from the line.
+    tall = set(np.nonzero(ext >= max(5, 0.5 * ext.max()))[0].tolist())
+    cmax = int(np.argmax(ext))
+    lo = hi = cmax
+    while lo - 1 in tall:
+        lo -= 1
+    while hi + 1 in tall:
+        hi += 1
+    patch = ink[:, lo:hi + 1]
+    ry = np.nonzero(patch.any(axis=1))[0]
+    if ry.size < 4:
+        return None
+    patch = patch[ry.min():ry.max() + 1]
+    # drop error-bar overhang: keep a compact core centred on the marker
+    ph, pw = patch.shape
+    if ph > 1.8 * pw:
+        cy = ph // 2
+        half = int(round(0.9 * pw))
+        patch = patch[max(0, cy - half):min(ph, cy + half + 1)]
+    if min(patch.shape) < 4:
+        return None
+    return patch.astype(np.float32)
+
+
+def template_match_markers(ink_mask, template, plot_area, legend_box=None,
+                           thresh=0.40, log_fn=None, name=''):
+    """Find this curve's markers by exact-matching the legend marker shape.
+
+    Correlation runs on the curve's BINARY ink map, so the match is on shape
+    rather than shade -- a marker dimmed by anti-aliasing or partly covered by
+    another curve still correlates on the part that survives.  Peaks are picked
+    strongest-first with a separation of roughly one marker width.
+
+    Returns [(cx, cy, score), ...].  Partial occlusion is deliberately NOT
+    resolved here: these are handed to the correction stage, which decides what
+    is real from the reconstruction error.
+    """
+    if template is None or ink_mask is None:
+        return []
+    th, tw = template.shape[:2]
+    m = np.asarray(ink_mask, bool).copy()
+    H, W = m.shape
+    keep = np.zeros((H, W), bool)
+    px0, py0, px1, py1 = [int(v) for v in plot_area]
+    keep[py0:py1 + 1, px0:px1 + 1] = True
+    if legend_box:
+        lx0, ly0, lx1, ly1 = [int(v) for v in legend_box]
+        keep[ly0:ly1 + 1, lx0:lx1 + 1] = False
+    m &= keep
+    if m.sum() < template.sum() * 0.5 or H < th or W < tw:
+        return []
+    res = cv2.matchTemplate(m.astype(np.float32), template, cv2.TM_CCOEFF_NORMED)
+    if res.size == 0:
+        return []
+    thr = max(thresh, float(res.max()) * 0.55)
+    ys, xs = np.where(res >= thr)
+    if ys.size == 0:
+        return []
+    scores = res[ys, xs]
+    sep = max(7, int(0.9 * max(tw, th)))
+    picks = []
+    for k in np.argsort(-scores):
+        cx = float(xs[k] + tw / 2.0)
+        cy = float(ys[k] + th / 2.0)
+        if any((cx - px) ** 2 + (cy - py) ** 2 <= sep * sep for px, py, _ in picks):
+            continue
+        # A marker occupies real height.  A dash of a reference rule or a
+        # gridline can correlate with the template's outline while being only a
+        # few px tall, so require the ink here to be as tall as the marker.
+        iy0 = max(0, int(cy - th))
+        iy1 = min(H, int(cy + th) + 1)
+        ix0 = max(0, int(cx - tw // 2))
+        ix1 = min(W, int(cx + tw // 2) + 1)
+        loc = m[iy0:iy1, ix0:ix1]
+        if not loc.any():
+            continue
+        ext = max((np.ptp(np.nonzero(loc[:, c])[0]) + 1)
+                  for c in range(loc.shape[1]) if loc[:, c].any())
+        if ext < 0.5 * th:
+            continue
+        picks.append((cx, cy, float(scores[k])))
+    if log_fn:
+        log_fn("    [marker-template] %s: %dx%d template, %d match(es) "
+               "(thr %.2f)" % (name, tw, th, len(picks), thr))
+    return picks
+
+
+def _resolve_orphan_segments(gray_segments, curves, img_bgr, plot_area,
+                             legend_box=None, log_fn=print,
+                             ep_tol=6, vote_frac=0.58,
+                             dist_gate=62.0, margin=28.0):
+    """Assign plot-as-BW segments that no curve's ink claimed, by continuity + colour.
+
+    A greyscale segment taken from the whole plot describes some curve, but in a
+    crowded region its body can straddle several curves' dilated ink and so fail
+    every curve's `_segments_near_mask` test, leaving it unassigned.  Such a
+    segment still belongs to exactly one curve, placed by two signals:
+
+      * own colour -- the ORIGINAL pixels under the segment vote for one legend
+                      swatch.  This is the primary signal: it rescues a segment
+                      that has no assigned neighbour and, at a crossing, overrides
+                      a neighbour belonging to a different curve.
+      * continuity -- the segment shares an endpoint (<= ep_tol px) with a segment
+                      already assigned to a curve, so it continues that curve's
+                      polyline; used to narrow the candidates at a crossing.
+
+    Assignment uses per-curve masks built by NEAREST swatch (a pixel is ink for
+    the curve whose swatch->white tube it is closest to), so broad overlapping
+    masks cannot let one curve claim a neighbour's segment -- the failure mode of
+    the plain swatch masks in dense multi-curve plots.  A segment whose colour
+    vote is split across curves (a true crossing the greyscale traced through) is
+    left unassigned rather than forced onto a guess.
+
+    Returns {curve_name: [segment, ...]} : segments to ADD to that curve.  The
+    stage is purely additive; it never removes or reassigns existing segments.
+    """
+    names, sw = [], {}
+    for ci, cv_ in enumerate(curves):
+        s = cv_.get('swatch_rgb')
+        if s is None:
+            continue
+        n = cv_.get('name', 'curve%d' % ci)
+        names.append(n); sw[n] = np.asarray(s, np.float64)
+    if not gray_segments or len(names) < 2:
+        return {}
+
+    H, W = img_bgr.shape[:2]
+    rgb = img_bgr[:, :, ::-1].astype(np.float64)
+
+    # Nearest swatch->white tube per pixel -> exclusive per-curve ink masks.
+    # (best_i / best_d are kept incrementally so only two H*W planes are held.)
+    white = np.array([255.0, 255.0, 255.0])
+    best_d = np.full((H, W), 1e9)
+    best_i = np.full((H, W), -1, int)
+    for i, n in enumerate(names):
+        s = sw[n]; d = white - s; den = float(d @ d) or 1.0
+        t = np.clip(((rgb - s) @ d) / den, 0.0, 1.0)
+        dd = np.linalg.norm(rgb - (s + t[..., None] * d), axis=-1)
+        dd[t > 0.70] = 1e9                     # too close to white for this curve
+        upd = dd < best_d
+        best_d[upd] = dd[upd]; best_i[upd] = i
+    nonwhite = rgb.min(axis=-1) < 244
+    roi = np.zeros((H, W), bool)
+    px0, py0, px1, py1 = [int(v) for v in plot_area]
+    roi[py0:py1 + 1, px0:px1 + 1] = True
+    if legend_box:
+        lx0, ly0, lx1, ly1 = [int(v) for v in legend_box]
+        roi[ly0:ly1 + 1, lx0:lx1 + 1] = False
+    owned = nonwhite & roi & (best_d <= 40.0)
+    dil = []
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))    # 2px, like the filter
+    for i in range(len(names)):
+        dil.append(cv2.dilate((owned & (best_i == i)).astype(np.uint8), k).astype(bool))
+
+    def _on(sg, dm):
+        x0, y0, x1, y1 = [int(round(v)) for v in sg[:4]]
+        st = max(2, int(max(abs(x1 - x0), abs(y1 - y0))))
+        hit = 0
+        for t in range(st + 1):
+            x = int(round(x0 + (x1 - x0) * t / st))
+            y = int(round(y0 + (y1 - y0) * t / st))
+            if 0 <= x < W and 0 <= y < H and dm[y, x]:
+                hit += 1
+        return hit >= 0.90 * (st + 1)
+
+    accept = [set() for _ in gray_segments]
+    for i, dm in enumerate(dil):
+        for j, sg in enumerate(gray_segments):
+            if _on(sg, dm):
+                accept[j].add(i)
+    orphans = [j for j, a in enumerate(accept) if not a]
+    if not orphans:
+        return {}
+
+    ep = [(np.asarray(s[:2], float), np.asarray(s[2:4], float)) for s in gray_segments]
+
+    def _conn(a, b):
+        a0, a1 = ep[a]; b0, b1 = ep[b]
+        return (np.linalg.norm(a0 - b0) <= ep_tol or np.linalg.norm(a0 - b1) <= ep_tol
+                or np.linalg.norm(a1 - b0) <= ep_tol or np.linalg.norm(a1 - b1) <= ep_tol)
+
+    def _colour(sg):
+        x0, y0, x1, y1 = [int(round(v)) for v in sg[:4]]
+        st = max(2, int(max(abs(x1 - x0), abs(y1 - y0))))
+        cols = []
+        for t in range(st + 1):
+            x = int(round(x0 + (x1 - x0) * t / st))
+            y = int(round(y0 + (y1 - y0) * t / st))
+            best = None
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    xx, yy = x + dx, y + dy
+                    if 0 <= xx < W and 0 <= yy < H and rgb[yy, xx].min() < 244:
+                        p = rgb[yy, xx]
+                        if best is None or p.sum() < best.sum():
+                            best = p
+            if best is not None:
+                cols.append(best)
+        if not cols:
+            return None
+        cols = np.asarray(cols)
+        votes = np.zeros(len(names))
+        for p in cols:
+            votes[int(np.argmin([np.linalg.norm(p - sw[nm]) for nm in names]))] += 1
+        return np.median(cols, axis=0), votes, len(cols)
+
+    ostat = {}
+    for j in orphans:
+        c = _colour(gray_segments[j])
+        if c is not None:
+            ostat[j] = c
+
+    def _d(med, i):
+        return float(np.linalg.norm(med - sw[names[i]]))
+
+    resolved = {}
+    pending = list(ostat.keys())
+    for _pass in range(6):
+        newly = []
+        for j in pending:
+            med, votes, ncol = ostat[j]
+            cand = set()
+            for q, a in enumerate(accept):           # continuity: assigned neighbours
+                if q != j and a and _conn(j, q):
+                    cand |= a
+            for rq, ri in resolved.items():          # + neighbours resolved this run
+                if rq != j and _conn(j, rq):
+                    cand.add(ri)
+            own = int(np.argmax(votes))              # own colour: a clear majority
+            if votes[own] >= vote_frac * ncol and _d(med, own) <= dist_gate:
+                cand.add(own)
+            if not cand:
+                continue
+            ranked = sorted(cand, key=lambda i: _d(med, i))
+            best = ranked[0]
+            if _d(med, best) <= dist_gate and (
+                    len(ranked) == 1 or _d(med, ranked[1]) - _d(med, best) >= margin):
+                resolved[j] = best
+                newly.append(j)
+        for j in newly:
+            pending.remove(j)
+        if not newly:
+            break
+
+    out = {}
+    for j, i in resolved.items():
+        out.setdefault(names[i], []).append(gray_segments[j])
+    log_fn("  [orphan-rescue] %d unassigned BW segment(s): %d recovered by "
+           "continuity+colour, %d left (ambiguous crossings)"
+           % (len(orphans), len(resolved), len(orphans) - len(resolved)))
+    for n in sorted(out):
+        log_fn("    [orphan-rescue] %s: +%d segment(s)" % (n, len(out[n])))
+    return out
+
+
 def path_from_mask(ink_mask: np.ndarray):
     """Per-column representative y of the curve = its traced path.
 
@@ -483,7 +889,7 @@ def grid_path_candidates(ink_mask: np.ndarray, grid_xs, active_pts,
 
 
 def seed_candidates(step5, ref_bgr, active, cands, cls, cidx, min_gain=0.0008,
-                    log_fn=print):
+                    log_fn=print, max_seed=None, name=''):
     """Greedily add the grid x path candidates that measurably help.
 
     ACTIVATE only ever looks at the suppressed point nearest each l* endpoint, so
@@ -493,6 +899,10 @@ def seed_candidates(step5, ref_bgr, active, cands, cls, cidx, min_gain=0.0008,
     a curve whose ink has no thickness cue (markers hidden under other curves,
     neutral error bars) recover its points at all.
 
+    This runs BEFORE the greedy and is not part of `max_iters`, so it can add
+    several points even on a single-iteration run; `max_seed` caps how many, and
+    0 disables seeding entirely when a run has to be one action exactly.
+
     Returns (seeded_active_points, leftover_candidates).
     """
     H, W = ref_bgr.shape[:2]
@@ -501,9 +911,18 @@ def seed_candidates(step5, ref_bgr, active, cands, cls, cidx, min_gain=0.0008,
     dist = lambda pts: step5.ssim_dist(ref_bgr, step5.render_from_points(P(pts), (H, W)))
     cur = list(active)
     pool = [(float(c['cx']), float(c['cy'])) for c in cands]
+    if max_seed is not None and int(max_seed) <= 0:
+        left = [{'cx': float(x), 'cy': float(y),
+                 'class_name': 'suppressed', 'class_idx': -1} for (x, y) in pool]
+        log_fn(f"    [seed] {name}: disabled -- {len(pool)} candidate(s) "
+               f"left suppressed")
+        return cur, left
     base = dist(cur)
     added = 0
     while pool:
+        if max_seed is not None and added >= int(max_seed):
+            log_fn(f"    [seed] {name}: cap of {int(max_seed)} reached")
+            break
         scored = [(dist(sorted(cur + [c])), c) for c in pool]
         scored.sort(key=lambda z: z[0])
         best_d, best_c = scored[0]
@@ -512,7 +931,8 @@ def seed_candidates(step5, ref_bgr, active, cands, cls, cidx, min_gain=0.0008,
         cur = sorted(cur + [best_c]); pool.remove(best_c)
         base = best_d; added += 1
     if added:
-        log_fn(f"    [seed] added {added} grid-path point(s), 1-SSIM -> {base:.5f}")
+        log_fn(f"    [seed] {name}: added {added} grid-path point(s) before "
+               f"the greedy (NOT counted in max_iters), 1-SSIM -> {base:.5f}")
     left = [{'cx': float(x), 'cy': float(y),
              'class_name': 'suppressed', 'class_idx': -1} for (x, y) in pool]
     return cur, left
@@ -527,6 +947,7 @@ def correct_colour_curves(img_bgr: np.ndarray,
                           legend_box=None,
                           marker_class: str = 'filled_circle',
                           max_iters=None,
+                          max_seed=None,
                           out_dir=None,
                           grid_xs=None,
                           workers=None,
@@ -570,6 +991,23 @@ def correct_colour_curves(img_bgr: np.ndarray,
     gray_segments = extract_segments(_gray_bin)
     log_fn(f"  [color-step5] plot-as-BW segments: {len(gray_segments)}")
 
+    # A plot-as-BW segment in a crowded region can straddle several curves' ink,
+    # so no curve's near-mask test claims it. Recover the ones that clearly belong
+    # to a single curve (endpoint continuity + own colour) and drop the genuinely
+    # ambiguous crossings. Purely additive -- each recovered segment is added to
+    # its curve's candidate list below; nothing existing is changed.
+    _rescued_segments = _resolve_orphan_segments(
+        gray_segments, curves, img_bgr, plot_area,
+        legend_box=legend_box, log_fn=log_fn)
+
+    # Axes / gridlines / reference rules are drawn in black, so an achromatic
+    # curve's colour tube claims them and points get detected strung along the
+    # x-axis or the LLOQ rule. Exclude them from every curve's ink.
+    _furniture = chart_furniture_mask(img_bgr, plot_area)
+    if _furniture.any():
+        log_fn(f"  [furniture] {int(_furniture.sum())} px of axis/rule lines "
+               f"excluded from curve ink")
+
     base_out = out_dir or tempfile.mkdtemp(prefix='color_step5_')
     os.makedirs(base_out, exist_ok=True)
 
@@ -599,6 +1037,12 @@ def correct_colour_curves(img_bgr: np.ndarray,
             mask = swatch_ink_mask(img_bgr, cv_.get('swatch_rgb', (0, 0, 0)),
                                    plot_area=plot_area)
         mask = np.asarray(mask, dtype=bool)
+        if _furniture.any():
+            _n_ink = int(mask.sum())
+            mask = mask & ~_furniture
+            if int(mask.sum()) != _n_ink:
+                log_fn(f"    [furniture] {name}: dropped "
+                       f"{_n_ink - int(mask.sum())} px on axis/rule lines")
         if not mask.any():
             log_fn(f"  [color-step5] {name}: empty ink mask -- skipped")
             return {'name': name, 'points': pts, 'n_before': len(pts),
@@ -639,6 +1083,16 @@ def correct_colour_curves(img_bgr: np.ndarray,
             _seg_src = ref
         mask_segments = extract_segments(_seg_src)
         near_gray = _segments_near_mask(gray_segments, mask)
+        # Add any orphan BW segments recovered for THIS curve (continuity+colour),
+        # skipping ones the near-mask test already kept.
+        _resc = _rescued_segments.get(name)
+        if _resc:
+            _near_ids = {id(s) for s in near_gray}
+            _resc = [s for s in _resc if id(s) not in _near_ids]
+            if _resc:
+                near_gray = list(near_gray) + list(_resc)
+                log_fn(f"    [orphan-rescue] {name}: +{len(_resc)} recovered "
+                       f"BW segment(s) added to candidates")
         # Remove segments that lie along this curve's error bars, so the greedy is
         # never offered an l* that sits on a stem.
         _stems = confirmed_stems(mask)
@@ -661,9 +1115,14 @@ def correct_colour_curves(img_bgr: np.ndarray,
         # Seed the grid x path proposals that measurably improve the objective,
         # BEFORE the greedy runs (ACTIVATE alone cannot reach mid-segment ones).
         step5._SSIM_CROP = tuple(int(v) for v in plot_area)   # same crop as the greedy
+        _n_supplied = len(pts)          # before seeding, for an honest tally
         if gcands:
+            _ms = max_seed
+            if _ms is None and os.environ.get('COLOR_STEP5_MAX_SEED') is not None:
+                _ms = int(os.environ['COLOR_STEP5_MAX_SEED'])
             pts, gcands = seed_candidates(step5, ref, pts, gcands, cls, cidx,
-                                          log_fn=log_fn)
+                                          log_fn=log_fn, max_seed=_ms, name=name)
+        _n_seeded = len(pts) - _n_supplied
 
         seen = set(); init_S = []
         for c in list(gcands) + list(mcands):
@@ -672,9 +1131,43 @@ def correct_colour_curves(img_bgr: np.ndarray,
                 continue
             seen.add(key); init_S.append(c)
 
+        # ACTIVE set = supplied points + markers found by exact-matching the
+        # legend marker shape.  A template hit is a data point seen directly in
+        # the plot, so it starts active; the path/density proposals above are
+        # inferred and start suppressed for the greedy to promote or discard.
+        _tm = []
+        _sbox = cv_.get('swatch_box')
+        if _sbox is not None and cv_.get('swatch_rgb') is not None:
+            _others = [c.get('swatch_rgb') for c in curves
+                       if c is not cv_ and c.get('swatch_rgb') is not None]
+            _tmpl = swatch_marker_template(img_bgr, _sbox, cv_['swatch_rgb'],
+                                           other_swatches=_others)
+            if _tmpl is not None:
+                _tm = template_match_markers(mask, _tmpl, plot_area,
+                                             legend_box=legend_box,
+                                             log_fn=log_fn, name=name)
+            elif log_fn:
+                log_fn(f"    [marker-template] {name}: line-only swatch, "
+                       f"no marker template")
+
+        _act = [(float(x), float(y)) for (x, y) in pts]
+        _n_pts = len(_act)
+        for cx, cy, _sc in _tm:                       # de-duplicate against pts
+            if all((cx - ax) ** 2 + (cy - ay) ** 2 > PT_MERGE_TOL ** 2
+                   for ax, ay in _act):
+                _act.append((cx, cy))
+        if log_fn and len(_act) > _n_pts:
+            log_fn(f"    [marker-template] {name}: +{len(_act) - _n_pts} new "
+                   f"active point(s) from template matches")
+
         init_P = [{'cx': float(x), 'cy': float(y),
                    'class_name': cls, 'class_idx': cidx,
-                   'confidence': 1.0} for (x, y) in pts]
+                   'confidence': 1.0} for (x, y) in _act]
+
+        # Keep the suppressed pool clear of anything now active.
+        init_S = [c for c in init_S
+                  if all((c['cx'] - ax) ** 2 + (c['cy'] - ay) ** 2 > PT_MERGE_TOL ** 2
+                         for ax, ay in _act)]
 
         # Minimal prep_info: the reference is already clean, so no clean_fn.
         prep_info = {
@@ -689,11 +1182,14 @@ def correct_colour_curves(img_bgr: np.ndarray,
         tmp_png = os.path.join(cur_out, 'reference.png')
         cv2.imwrite(tmp_png, ref)
 
-        log_fn(f"  [color-step5] {name}: {len(init_P)} pts, ink={int(mask.sum())}px, "
-               f"stroke lw={lw} marker_r={mr} | segs {len(mask_segments)}(mask)"
-               f"+{len(near_gray)}(BW) | suppressed {len(init_S)} "
-               f"({len(gcands)} grid-path, {len(mcands)} thickness), "
-               f"{len(vruns)} vertical rise(s) -> correcting ...")
+        log_fn(f"  [color-step5] {name}: active {len(init_P)} "
+               f"({_n_supplied} supplied + {_n_seeded} seeded + "
+               f"{len(init_P) - _n_pts} marker-template), "
+               f"ink={int(mask.sum())}px, stroke lw={lw} marker_r={mr} | "
+               f"segs {len(mask_segments)}(mask)+{len(near_gray)}(BW) | "
+               f"suppressed {len(init_S)} ({len(gcands)} grid-path, "
+               f"{len(mcands)} thickness), {len(vruns)} vertical rise(s) "
+               f"-> correcting ...")
         try:
             r = step5.run_correction(
                 img_path=tmp_png,
